@@ -1,4 +1,7 @@
-# Cortex-R: Multi-Agent AI System with MCP Protocol
+# Demo
+https://youtu.be/QuGs-XqpHac
+
+# Arc-Reactor Agent: Multi-Agent AI System with MCP Protocol
 
 A reasoning-driven AI agent that leverages the **Model Context Protocol (MCP)** to orchestrate multiple tool servers, enabling complex multi-step task solving through LLM-powered perception, memory, and decision-making.
 

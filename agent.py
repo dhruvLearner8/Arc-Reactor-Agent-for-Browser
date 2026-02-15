@@ -49,5 +49,10 @@ if __name__ == "__main__":
 # What do you know about Don Tapscott and Anthony Williams?
 # What is the relationship between Gensol and Go-Auto?
 # which course are we teaching on Canvas LMS?
-# Summarize this page: https://theschoolof.ai/
+
 # What is the log value of the amount that Anmol singh paid for his DLF apartment via Capbridge? 
+
+# What is current GDP of canada?
+# How much has canada's GDP increased from last year?
+# What is india's passport ranking and how much is it below canada?
+#  What is top 2 highest countries in terms of GDP? 
