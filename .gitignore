@@ -1,0 +1,33 @@
+# Python
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables & secrets
+.env
+service_account.json
+credentials.json
+token.json
+
+# Project-specific
+/documents/
+/faiss_index/
+
+# UV
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,75 @@
+agent:
+  name: Arc-Reactor
+  id: cortex_r_001
+  description: >
+    A reasoning-driven AI agent capable of using external tools
+    and memory to solve complex tasks step-by-step.
+
+strategy:
+  type: conservative         # Options: conservative, retry_once, explore_all
+  max_steps: 10               # Maximum tool-use iterations before termination
+
+memory:
+  top_k: 3
+  type_filter: tool_output   # Options: tool_output, fact, query, all
+  embedding_model: nomic-embed-text
+  embedding_url: http://localhost:11434/api/embeddings
+
+llm:
+  text_generation: gemini
+  embedding: nomic
+
+persona:
+  tone: concise
+  verbosity: low
+  behavior_tags: [rational, focused, tool-using]
+
+mcp_servers:
+  - id: math
+    script: mcp_server_1.py
+    cwd: c:/Users/dhruv/OneDrive/Desktop/Projects/EAG V2/S8 Share
+  - id: documents
+    script: mcp_server_2.py
+    cwd: c:/Users/dhruv/OneDrive/Desktop/Projects/EAG V2/S8 Share
+  - id: websearch
+    script: mcp_server_3.py
+    cwd: c:/Users/dhruv/OneDrive/Desktop/Projects/EAG V2/S8 Share
+
+
+
+
+# config/profiles.yaml → Agent Profiles / Persona Settings
+# Role: Defines agent-specific config: name, strategy, preferences, tool categories.
+
+# Responsibilities:
+
+# Make agent identity configurable without touching code
+
+# Store:
+
+# Name, ID
+
+# Strategy type
+
+# Memory settings
+
+# Tone/personality
+
+# Dependencies:
+
+# context.py and strategy.py load this on startup
+
+# Format: YAML
+
+# Example:
+
+# yaml
+# Copy
+# Edit
+# name: Cortex-R
+# strategy: conservative
+# memory:
+#   top_k: 3
+#   type_filter: tool_output
+# tone: concise, helpful
+# config/profiles.yaml
