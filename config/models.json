@@ -28,6 +28,15 @@
         "embed": "http://localhost:11434/api/embeddings"
       }
     },
+    "qwen2.5:32b-instruct-q4_0": {
+      "type": "ollama",
+      "model": "qwen2.5:32b-instruct-q4_0",
+      "embedding_model": "qwen2.5:32b-instruct-q4_0 ",
+      "url": {
+        "generate": "http://localhost:11434/api/generate",
+        "embed": "http://localhost:11434/api/embeddings"
+      }
+    },
     "nomic": {
       "type": "huggingface",
       "model": "nomic-ai/nomic-embed-text-v1",

@@ -10,6 +10,9 @@ import asyncio
 from datetime import datetime, timedelta
 import time
 import re
+from pydantic import BaseModel, Field
+from models import SearchInput, UrlInput
+from models import PythonCodeOutput  # Import the models we need
 
 
 @dataclass
@@ -67,7 +70,7 @@ class DuckDuckGoSearcher:
         return "\n".join(output)
 
     async def search(
-        self, query: str, ctx: Context, max_results: int = 5
+        self, query: str, ctx: Context, max_results: int = 10
     ) -> List[SearchResult]:
         try:
             # Apply rate limiting
@@ -83,15 +86,15 @@ class DuckDuckGoSearcher:
             await ctx.info(f"Searching DuckDuckGo for: {query}")
 
             async with httpx.AsyncClient() as client:
-                response = await client.post(
+                result = await client.post(
                     self.BASE_URL, data=data, headers=self.HEADERS, timeout=30.0
                 )
-                response.raise_for_status()
+                result.raise_for_status()
 
-            # Parse HTML response
-            soup = BeautifulSoup(response.text, "html.parser")
+            # Parse HTML result
+            soup = BeautifulSoup(result.text, "html.parser")
             if not soup:
-                await ctx.error("Failed to parse HTML response")
+                await ctx.error("Failed to parse HTML result")
                 return []
 
             results = []
@@ -157,7 +160,7 @@ class WebContentFetcher:
             await ctx.info(f"Fetching content from: {url}")
 
             async with httpx.AsyncClient() as client:
-                response = await client.get(
+                result = await client.get(
                     url,
                     headers={
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -165,10 +168,10 @@ class WebContentFetcher:
                     follow_redirects=True,
                     timeout=30.0,
                 )
-                response.raise_for_status()
+                result.raise_for_status()
 
             # Parse the HTML
-            soup = BeautifulSoup(response.text, "html.parser")
+            soup = BeautifulSoup(result.text, "html.parser")
 
             # Remove script and style elements
             for element in soup(["script", "style", "nav", "header", "footer"]):
@@ -212,34 +215,20 @@ fetcher = WebContentFetcher()
 
 
 @mcp.tool()
-async def search(query: str, ctx: Context, max_results: int = 10) -> str:
-    """
-    Search DuckDuckGo and return formatted results.
-
-    Args:
-        query: The search query string
-        max_results: Maximum number of results to return (default: 10)
-        ctx: MCP context for logging
-    """
+async def duckduckgo_search_results(input: SearchInput, ctx: Context) -> PythonCodeOutput:
+    """Search DuckDuckGo. """
     try:
-        results = await searcher.search(query, ctx, max_results)
-        return searcher.format_results_for_llm(results)
+        results = await searcher.search(input.query, ctx, input.max_results)
+        return PythonCodeOutput(result=searcher.format_results_for_llm(results))
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         return f"An error occurred while searching: {str(e)}"
 
 
 @mcp.tool()
-async def fetch_content(url: str, ctx: Context) -> str:
-    """
-    Fetch and parse content from a webpage URL.
-
-    Args:
-        url: The webpage URL to fetch content from
-        ctx: MCP context for logging
-    """
-    return await fetcher.fetch_and_parse(url, ctx)
-
+async def download_raw_html_from_url(input: UrlInput, ctx: Context) -> PythonCodeOutput:
+    """Fetch webpage content. """
+    return PythonCodeOutput(result=await fetcher.fetch_and_parse(input.url, ctx))
 
 
 if __name__ == "__main__":

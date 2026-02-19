@@ -1,33 +1,16 @@
-# Python
-*.pyc
+# Python-generated files
 __pycache__/
-*.egg-info/
-dist/
+*.py[oc]
 build/
-
-# Virtual environment
-.venv/
-venv/
-
-# Environment variables & secrets
-.env
-service_account.json
-credentials.json
-token.json
-
-# Project-specific
-/documents/
+dist/
+wheels/
+*.egg-info
+*.json
+*.env
+/document/
 /faiss_index/
+*.pyc 
 
-# UV
-uv.lock
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
+# Virtual environments
+.venv

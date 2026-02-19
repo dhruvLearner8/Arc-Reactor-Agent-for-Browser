@@ -13,7 +13,7 @@ from pathlib import Path
 import requests
 from markitdown import MarkItDown
 import time
-from models import AddInput, AddOutput, SqrtInput, SqrtOutput, StringsToIntsInput, StringsToIntsOutput, ExpSumInput, ExpSumOutput, PythonCodeInput, PythonCodeOutput, UrlInput, FilePathInput, MarkdownInput, MarkdownOutput, ChunkListOutput
+from models import AddInput, AddOutput, SqrtInput, SqrtOutput, StringsToIntsInput, StringsToIntsOutput, ExpSumInput, ExpSumOutput, PythonCodeInput, PythonCodeOutput, UrlInput, FilePathInput, MarkdownInput, MarkdownOutput, ChunkListOutput, SearchDocumentsInput
 from tqdm import tqdm
 import hashlib
 from pydantic import BaseModel
@@ -33,6 +33,7 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 EMBED_MODEL = "nomic-embed-text"
 GEMMA_MODEL = "gemma3:12b"
 PHI_MODEL = "phi4:latest"
+QWEN_MODEL = "qwen2.5:32b-instruct-q4_0 "
 CHUNK_SIZE = 256
 CHUNK_OVERLAP = 40
 MAX_CHUNK_LENGTH = 512  # characters
@@ -41,9 +42,9 @@ ROOT = Path(__file__).parent.resolve()
 
 
 def get_embedding(text: str) -> np.ndarray:
-    response = requests.post(EMBED_URL, json={"model": EMBED_MODEL, "prompt": text})
-    response.raise_for_status()
-    return np.array(response.json()["embedding"], dtype=np.float32)
+    result = requests.post(EMBED_URL, json={"model": EMBED_MODEL, "prompt": text})
+    result.raise_for_status()
+    return np.array(result.json()["embedding"], dtype=np.float32)
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     words = text.split()
@@ -83,27 +84,29 @@ Just respond in one word (Yes or No), and do not provide any further explanation
     print(f"  Chunk {index} → {chunk1[:60]}{'...' if len(chunk1) > 60 else ''}")
     print(f"  Chunk {index+1} → {chunk2[:60]}{'...' if len(chunk2) > 60 else ''}")
 
-    response = requests.post(OLLAMA_CHAT_URL, json={
+    result = requests.post(OLLAMA_CHAT_URL, json={
         "model": PHI_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False
     })
-    response.raise_for_status()
-    reply = response.json().get("message", {}).get("content", "").strip().lower()
+    result.raise_for_status()
+    reply = result.json().get("message", {}).get("content", "").strip().lower()
     print(f"  ✅ Model reply: {reply}")
     return reply.startswith("yes")
 
 
 
 @mcp.tool()
-def search_documents(query: str) -> list[str]:
-    """Search indexed documents for relevant content. Usage: search_documents|query="india Current GDP" """
+def search_stored_documents_rag(input: SearchDocumentsInput) -> list[str]:
+    """Search old stored documents like PDF, DOCX, TXT, etc. to get relevant extracts. """
+
     ensure_faiss_ready()
+    query = input.query
     mcp_log("SEARCH", f"Query: {query}")
     try:
         index = faiss.read_index(str(ROOT / "faiss_index" / "index.bin"))
         metadata = json.loads((ROOT / "faiss_index" / "metadata.json").read_text())
-        query_vec = get_embedding(query).reshape(1, -1)
+        query_vec = get_embedding(query ).reshape(1, -1)
         D, I = index.search(query_vec, k=5)
         results = []
         for idx in I[0]:
@@ -126,8 +129,8 @@ def caption_image(img_url_or_path: str) -> str:
 
     try:
         if img_url_or_path.startswith("http"): # for extract_web_pages
-            response = requests.get(img_url_or_path)
-            encoded_image = base64.b64encode(response.content).decode("utf-8")
+            result = requests.get(img_url_or_path)
+            encoded_image = base64.b64encode(result.content).decode("utf-8")
         else:
             with open(full_path, "rb") as img_file:
                 encoded_image = base64.b64encode(img_file.read()).decode("utf-8")
@@ -135,18 +138,18 @@ def caption_image(img_url_or_path: str) -> str:
         # Set stream=True to get the full generator-style output
         with requests.post(OLLAMA_URL, json={
             "model": GEMMA_MODEL,
-            "prompt": "If there is lot of text in the image, then ONLY reply back with exact text in the image, else Describe the image such that your response can replace 'alt-text' for it. Only explain the contents of the image and provide no further explaination.",
+            "prompt": "If there is lot of text in the image, then ONLY reply back with exact text in the image, else Describe the image such that your result can replace 'alt-text' for it. Only explain the contents of the image and provide no further explaination.",
             "images": [encoded_image],
             "stream": True
-        }, stream=True) as response:
+        }, stream=True) as result:
 
             caption_parts = []
-            for line in response.iter_lines():
+            for line in result.iter_lines():
                 if not line:
                     continue
                 try:
                     data = json.loads(line)
-                    caption_parts.append(data.get("response", ""))
+                    caption_parts.append(data.get("result", ""))
                     if data.get("done", False):
                         break
                 except json.JSONDecodeError:
@@ -184,8 +187,8 @@ def replace_images_with_captions(markdown: str) -> str:
 
 
 @mcp.tool()
-def extract_webpage(input: UrlInput) -> MarkdownOutput:
-    """Extract and convert webpage content to markdown. Usage: extract_webpage|input={"url": "https://example.com"}"""
+def convert_webpage_url_into_markdown(input: UrlInput) -> MarkdownOutput:
+    """Return clean webpage content without Ads, and clutter. """
 
     downloaded = trafilatura.fetch_url(input.url)
     if not downloaded:
@@ -204,7 +207,8 @@ def extract_webpage(input: UrlInput) -> MarkdownOutput:
 
 @mcp.tool()
 def extract_pdf(input: FilePathInput) -> MarkdownOutput:
-    """Convert PDF file content to markdown format. Usage: extract_pdf|input={"file_path": "documents/dlf.pdf"}"""
+    """Convert PDF to markdown. """
+
 
     if not os.path.exists(input.file_path):
         return MarkdownOutput(markdown=f"File not found: {input.file_path}")
@@ -260,12 +264,12 @@ Keep markdown formatting intact.
 """
 
         try:
-            response = requests.post(OLLAMA_CHAT_URL, json={
+            result = requests.post(OLLAMA_CHAT_URL, json={
                 "model": PHI_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False
             })
-            reply = response.json().get("message", {}).get("content", "").strip()
+            reply = result.json().get("message", {}).get("content", "").strip()
 
             if reply:
                 # If LLM returned second part, separate it
