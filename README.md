@@ -27,59 +27,179 @@ https://www.youtube.com/watch?v=axn0NaeZ65Y
 ## Architecture
 
 ```
-User Query
-    │
-    ▼
-┌──────────┐     ┌──────────┐     ┌──────────┐
-│ MEMORY   │────▶│PERCEPTION│────▶│ DECISION │
-│ (fuzzy   │     │ (analyze │     │ (plan +  │
-│  search  │     │  query   │     │  pick    │
-│  past    │     │  with    │     │  tools + │
-│  sessions│     │  Gemini) │     │  write   │
-│  )       │     │          │     │  code)   │
-└──────────┘     └──────────┘     └─────┬────┘
-                                        │
-                      ┌─────────────────┘
-                      ▼
-               ┌──────────┐
-               │  ACTION  │ ← sandboxed executor
-               │(run code │   runs LLM-generated code
-               │ via MCP) │   with AST safety transforms
-               └─────┬────┘
-                     │
-                     ▼
-               ┌──────────┐
-               │PERCEPTION│ ← evaluates the result
-               │(step eval)│
-               └─────┬────┘
-                     │
-          ┌──────────┼──────────┐
-          ▼          ▼          ▼
-      GOAL MET   LOCAL OK    FAILED
-      (done!)   (next step) (replan)
+                         ┌─────────────────────────────────────────┐
+                         │            User Query                   │
+                         └─────────────────┬───────────────────────┘
+                                           │
+                                           ▼
+                    ┌─────────────────────────────────────────────┐
+                    │              1. MEMORY SEARCH                │
+                    │  Fuzzy-match query against past sessions     │
+                    │  (rapidfuzz over session_logs/*.json)        │
+                    │  Returns top 3 similar past Q&A pairs        │
+                    └─────────────────┬───────────────────────────┘
+                                      │
+                         past matches + original query
+                                      │
+                                      ▼
+                    ┌─────────────────────────────────────────────┐
+                    │         2. PERCEPTION (Initial)              │
+                    │  Gemini analyzes: entities, intent, context  │
+                    │                                             │
+                    │  Checks: Can this be answered from memory?   │
+                    │  ┌─────────┐                                │
+                    │  │ YES     │──▶ Return answer immediately    │
+                    │  │(goal    │    (no tools needed)            │
+                    │  │achieved)│                                 │
+                    │  └────┬────┘                                │
+                    │       │ NO                                   │
+                    └───────┼─────────────────────────────────────┘
+                            │
+                            ▼
+                    ┌─────────────────────────────────────────────┐
+                    │           3. DECISION (Plan V1)              │
+                    │  Gemini receives:                            │
+                    │    • Perception output                       │
+                    │    • Full list of available MCP tools        │
+                    │    • Planning strategy (exploratory/conserv) │
+                    │                                             │
+                    │  Produces:                                   │
+                    │    • plan_text: ["Step 0: ...", "Step 1: .."]│
+                    │    • First step as JSON with executable code │
+                    │      {type: "CODE", code: "result = add(2,3)│
+                    │       \nreturn result"}                     │
+                    └─────────────────┬───────────────────────────┘
+                                      │
+             ┌────────────────────────┘
+             │
+             │        ╔══════════════════════════════════════╗
+             │        ║         AGENT LOOP (while)           ║
+             │        ╚══════════════════════════════════════╝
+             │
+             ▼
+    ┌─────────────────────────────────────────────────────────┐
+    │               4. ACTION (Executor)                       │
+    │                                                          │
+    │  Takes the code string from Decision and:                │
+    │                                                          │
+    │  a) Parse → AST (Abstract Syntax Tree)                   │
+    │  b) KeywordStripper: add(a=2,b=3) → add(2,3)            │
+    │  c) AwaitTransformer: add(2,3) → await add(2,3)          │
+    │  d) Auto-add "return result" if missing                  │
+    │  e) Wrap in async def __main()                           │
+    │  f) Execute in sandbox:                                  │
+    │     • Restricted builtins (no open/eval/exec)            │
+    │     • Whitelisted modules only (math, json, re...)       │
+    │     • MCP tool proxies injected as regular functions     │
+    │                                                          │
+    │  Tool calls route through MCP:                           │
+    │  add(2,3) → proxy → mcp.function_wrapper("add",2,3)     │
+    │           → MCP server subprocess → returns 5            │
+    │                                                          │
+    │  Returns: {status: "success", result: "5"}               │
+    │       or: {status: "error", error: "..."}                │
+    └──────────────────────┬──────────────────────────────────┘
+                           │
+                      execution result
+                           │
+                           ▼
+    ┌─────────────────────────────────────────────────────────┐
+    │          5. PERCEPTION (Step Evaluation)                  │
+    │                                                          │
+    │  Gemini evaluates the result against the original goal:  │
+    │                                                          │
+    │  Output fields:                                          │
+    │    • original_goal_achieved (bool)                        │
+    │    • local_goal_achieved (bool)                           │
+    │    • confidence (0.0 - 1.0)                              │
+    │    • solution_summary (if goal met)                       │
+    │    • reasoning (why this assessment)                      │
+    └──────────────────────┬──────────────────────────────────┘
+                           │
+            ┌──────────────┼──────────────┐
+            ▼              ▼              ▼
+    ┌──────────────┐ ┌───────────┐ ┌──────────────┐
+    │ GOAL MET     │ │ LOCAL OK  │ │   FAILED     │
+    │              │ │           │ │              │
+    │ original_    │ │ local_    │ │ Both false   │
+    │ goal = true  │ │ goal=true │ │              │
+    │              │ │ original  │ │ Step was     │
+    │ Save session │ │ =false    │ │ unhelpful    │
+    │ to memory    │ │           │ │              │
+    │ Return answer│ │ Ask       │ │ Decision     │
+    │ to user      │ │ Decision  │ │ REPLANS      │
+    │              │ │ for next  │ │ (new plan    │
+    │   ═══EXIT════│ │ step      │ │  version)    │
+    └──────────────┘ └─────┬─────┘ └──────┬───────┘
+                           │              │
+                           │   ┌──────────┘
+                           │   │
+                           ▼   ▼
+                    ┌─────────────────────────────────────────────┐
+                    │      6. DECISION (Mid-Session)               │
+                    │                                             │
+                    │  Gemini receives:                            │
+                    │    • Original query                          │
+                    │    • Current plan_text                       │
+                    │    • All completed steps + their results     │
+                    │    • The latest step's perception feedback   │
+                    │                                             │
+                    │  If local_goal was met:                      │
+                    │    → Returns next planned step               │
+                    │  If step failed:                             │
+                    │    → Revises plan, returns new step          │
+                    │    → May switch tools or change approach     │
+                    │    → Failed step stored in failure memory    │
+                    └─────────────────┬───────────────────────────┘
+                                      │
+                                      │ next step
+                                      │
+                         ┌────────────┘
+                         │
+                         └──────▶ Back to step 4 (ACTION)
+                                  Loop continues...
+
+             ╔══════════════════════════════════════════════════╗
+             ║  Loop exits when:                                ║
+             ║  • original_goal_achieved = true (answer found)  ║
+             ║  • Step type = CONCLUDE (direct answer)          ║
+             ║  • Step type = NOP (needs user clarification)    ║
+             ║  • Max iterations reached                        ║
+             ╚══════════════════════════════════════════════════╝
+
+                         ┌─────────────────────────────────────┐
+                         │        7. SESSION SAVED              │
+                         │  memory/session_logs/YYYY/MM/DD/     │
+                         │  <session_id>.json                   │
+                         │                                     │
+                         │  Contains: query, all plan versions, │
+                         │  every step + result, final answer   │
+                         │                                     │
+                         │  Available for future memory search  │
+                         └─────────────────────────────────────┘
 ```
 
 ### How One Query Flows Through the System
 
-1. **Memory Search** — Fuzzy-matches your query against past sessions using `rapidfuzz`. If a similar question was answered before, the agent can short-circuit without calling any tools.
+**Example: "What is the current stock price of Tesla?"**
 
-2. **Perception (Initial)** — Gemini analyzes the query: extracts entities, determines what kind of result is needed, and checks if the answer is already available from memory.
+**Step 1 — Memory Search:** Scans all past session JSON files in `memory/session_logs/`. Uses `rapidfuzz` to fuzzy-match the query against previous queries and their solutions. Returns top 3 matches. If "Tesla stock price" was asked before, the match score will be high.
 
-3. **Decision** — Gemini receives the perception output + the full list of available MCP tools, and produces:
-   - A natural language plan (e.g., "Step 0: Search DuckDuckGo, Step 1: Extract price, Step 2: Conclude")
-   - The first executable step as a JSON object with actual Python code
+**Step 2 — Perception (Initial):** Gemini analyzes the query + memory matches. Extracts entities (`Tesla`, `stock price`), determines a numerical result is expected, and checks if memory already has the answer. If yes → returns immediately (no tools). If no → proceeds to Decision.
 
-4. **Action (Executor)** — The generated code runs in a sandboxed environment:
-   - Tool calls like `add(2, 3)` are transparently routed to MCP servers via async proxies
-   - The AST is transformed to auto-await async calls and strip keyword arguments
-   - Restricted builtins and allowed modules only — no filesystem or network access outside MCP
+**Step 3 — Decision (Plan V1):** Gemini sees the available tools (`duckduckgo_search_results`, `download_raw_html_from_url`, `add`, `multiply`, etc.) and creates a plan:
+- Plan: `["Step 0: Search DuckDuckGo for Tesla stock price", "Step 1: Download the top result page", "Step 2: Extract and conclude"]`
+- Returns Step 0 with code: `result = duckduckgo_search_results("Tesla stock price", 5)\nreturn result`
 
-5. **Perception (Step Eval)** — Evaluates the execution result:
-   - `original_goal_achieved` → done, return answer
-   - `local_goal_achieved` → this step worked, get next step from Decision
-   - Both false → step failed, trigger a replan
+**Step 4 — Action:** The executor takes that code string, parses it into an AST, auto-awaits the `duckduckgo_search_results` call, wraps it in `async def __main()`, and runs it in the sandbox. The function call routes through the MCP proxy to `mcp_server_3.py`, which performs the actual DuckDuckGo search. Returns 5 search results with URLs and snippets.
 
-6. **Loop continues** until the goal is met, a conclusion is reached, or clarification is needed.
+**Step 5 — Perception (Eval):** Gemini evaluates: "We got search result URLs but not the actual stock price." Sets `local_goal_achieved = true` (the search worked), `original_goal_achieved = false` (we don't have the price yet).
+
+**Step 6 — Decision (Mid-Session):** Sees that Step 0 succeeded but the goal isn't met. Returns Step 1: `result = download_raw_html_from_url("https://finance.yahoo.com/quote/TSLA/")\nreturn result`
+
+**Loop continues:** Action executes → Perception evaluates → if the page content has the price, goal is met → session saved → answer returned to user.
+
+**If something fails** (e.g., the URL is blocked), Perception marks both goals as false, Decision replans with a different approach (try a different URL, or try Google Finance instead).
 
 ---
 
