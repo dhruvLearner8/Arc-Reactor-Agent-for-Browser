@@ -5,8 +5,15 @@ A modular, reasoning-driven AI agent that autonomously solves complex multi-step
 > Ask it anything — from math computations to document analysis to live web searches — and watch it reason through the problem step by step.
 
 ---
+## Sample Demo-1
 
-## Demo
+https://drive.google.com/file/d/12sj_R2UBw3OuS2sAycyWBG9OcEcAvHcN/view?usp=sharing
+
+## Sample Demo-2
+
+https://drive.google.com/file/d/1crv6VEyKxHl9ayX-FNOpBnvbzeQMZvwQ/view?usp=sharing
+
+## Full Demo
 
 https://www.youtube.com/watch?v=axn0NaeZ65Y
 
