@@ -1,21 +1,23 @@
 mcp_servers:
-  - id: math
-    script: mcp_server_1.py
-    cwd: c:/Users/dhruv/OneDrive/Desktop/Projects/EAG V2/S10Share/mcp_servers
-    description: "Most used Math tools, including special string-int conversions, fibonacci, python sandbox, shell and sql related tools"
-    capabilities: ["add", "subtract", "multiply", "divide", "power", "cbrt", "factorial", "remainder", "sin", "cos", "tan", "mine", "create_thumbnail", "strings_to_chars_to_int", "int_list_to_exponential_sum", "fibonacci_numbers"]
+  # - id: math
+  #   script: mcp_server_1.py
+  #   cwd: I:/TSAI/2025/EAG/Session 16/S16A/mcp_servers
+  #   transport: stdio
+  #   description: "Most used Math tools, including special string-int conversions, fibonacci, python sandbox, shell and sql related tools"
   - id: documents
     script: mcp_server_2.py
-    cwd: c:/Users/dhruv/OneDrive/Desktop/Projects/EAG V2/S10Share/mcp_servers
+    cwd: C:/Users/dhruv/OneDrive/Desktop/Projects/EAG V2/S15_NewArch/S15_NewArch/mcp_servers
     description: "Load, search and extract within webpages, local PDFs or other documents. Web and document specialist"
-    capabilities: ["search_stored_documents_rag", "convert_webpage_url_into_markdown", "extract_pdf"]
   - id: websearch
     script: mcp_server_3.py
-    cwd: c:/Users/dhruv/OneDrive/Desktop/Projects/EAG V2/S10Share/mcp_servers
+    cwd: C:/Users/dhruv/OneDrive/Desktop/Projects/EAG V2/S15_NewArch/S15_NewArch/mcp_servers
+    transport: stdio
     description: "Webtools to search internet for queries and fetch content for a specific web page"
-    capabilities: ["duckduckgo_search_results", "download_raw_html_from_url"]
-  - id: mixed
-    script: mcp_server_4.py
-    cwd: c:/Users/dhruv/OneDrive/Desktop/Projects/EAG V2/S10Share/mcp_servers
-    description: "Most used Math tools"
-    capabilities: ["add", "subtract", "multiply", "divide"]
+  # - id: webbrowsing
+  #   script: http://localhost:8100/sse  # SSE URL
+  #   transport: sse
+  #   description: "Full Browser Access (persistent)"
+  # - id: mixed
+  #   script: mcp_server_4.py
+  #   cwd: I:/TSAI/2025/EAG/Session 16/S16A/mcp_servers
+  #   description: "Most used Math tools"

@@ -1,0 +1,12 @@
+{
+  "found_urls_T001": "['https://www.the-numbers.com/movie/Dhurandhar-(2025-India)', 'https://english.mathrubhumi.com/movies-music/dhurandhar-film-popcorn-sales-cinema-economics-bk2yrugh', 'https://www.theweek.in/news/entertainment/2026/02/03/dhurandhar-final-box-office-collection-analysis-how-much-money-did-jio-studios-and-b62-studios-make-from-theatres-in-india.html', 'https://indianexpress.com/article/entertainment/bollywood/all-the-records-ranveer-singhs-dhurandhar-broke-in-its-historic-75-day-box-office-run-10541094/', 'https://www.firstpost.com/entertainment/dhurandhar-box-office-ranveer-singhs-film-earns-rs-1100-crore-worldwide-creates-another-record-13963733.html']",
+  "dhurandhar_revenue_web_results_T001": {
+    "value": 1100,
+    "unit": "crore INR",
+    "as_of": "2026-02-26",
+    "sources": [
+      "https://www.firstpost.com/entertainment/dhurandhar-box-office-ranveer-singhs-film-earns-rs-1100-crore-worldwide-creates-another-record-13963733.html"
+    ],
+    "confidence": "high"
+  }
+}

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 
 # --- Math Tools ---
 
@@ -135,6 +135,9 @@ class ShellCommandInput(BaseModel):
 class UrlInput(BaseModel):
     url: str
 
+class URLListOutput(BaseModel):
+    result: List[str]
+
 class FilePathInput(BaseModel):
     file_path: str
 
@@ -172,3 +175,7 @@ class FilePathInput(BaseModel):
 
 class MarkdownOutput(BaseModel):
     markdown: str
+
+class SummaryInput(BaseModel):
+    url: str
+    prompt: Optional[str] = None 

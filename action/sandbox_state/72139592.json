@@ -1,0 +1,18 @@
+{
+  "found_urls_T001": "['https://en.wikipedia.org/wiki/Economy_of_Dubai', 'https://dxbnewsnetwork.com/dubais-growing-economy-key-industries-behind-its-success', 'https://arabbusinessconsultant.com/blog/top-industries-in-dubai-economy/', 'https://economymiddleeast.com/deep-dive-dubai-economy-growth-trade-innovation-insights/', 'https://www.investindubai.gov.ae/en/industries']",
+  "dubai_economic_history_T001": [],
+  "found_urls_T003": "['https://www.jafza.ae/', 'https://www.moet.gov.ae/en/-/jebel-ali-free-zone?redirect=%2Fen%2Fzone-details', 'https://economymiddleeast.com/news/dubai-jafza-celebrates-40-years-and-30-billion-in-investment-as-key-trade-hub-in-emirate/', 'https://dubaitimes.com/dubai-s-jebel-ali-free-zone-marks-40-years-of-economic-transformation', 'https://uaestories.com/from-ports-to-policies-how-dubai-is-rewiring/']",
+  "found_urls_T004": "['https://www.businessnewse.com/2025/05/25/the-role-of-real-estate-in-dubais-economy-sector-comparison-economic-impact/', 'https://economymiddleeast.com/deep-dive-dubai-economy-growth-trade-innovation-insights/', 'https://www.linkedin.com/pulse/dubais-economic-growth-its-impact-real-estate-rhdubai-vht2f', 'https://dmo.dof.gov.ae/en/news-and-publications/latest-press-releases/dubai-s-gdp-reaches-aed1197-billion-in-q1-2025-rising-4-year-on-year/', 'https://www.dib.ae/docs/default-source/dib-economic-bites/dib-lens-quarterly-report-july-2025.pdf?sfvrsn=cc6d5036_1']",
+  "found_urls_T005": "['https://www.dubaidet.gov.ae/en/research-and-insights/-/media/files/faqs/annual-visitor-report-2023/annual-report-2023-final.pdf', 'https://www.ijfmr.com/papers/2025/1/37573.pdf', 'https://www.emiratesnbdresearch.com/en/articles/dubai-tourism-sector-hit-new-records-in-2025', 'https://www.travelandtourworld.com/news/article/the-tourism-industries-of-dubai-abu-dhabi-and-ras-al-khaimah-reach-record-breaking-heights-world-travel-tourism-councils-report/', 'https://www.linkedin.com/pulse/economic-impact-tourism-dubais-development-academic-dubai-tourism-vostc']",
+  "found_urls_T006": "['https://www.difc.com/whats-on/news/record-20th-anniversary-year-results-solidify-difcs-position', 'https://www.gulftoday.ae/business/2025/03/28/dubai-international-financial-centre-key-to-dubais-economy']",
+  "found_urls_T002": [],
+  "dubai_oil_revenue_data_T002": [],
+  "dubai_trade_commerce_role_T003": [],
+  "dubai_real_estate_impact_T004": [],
+  "dubai_tourism_growth_T005": [],
+  "dubai_finance_sector_development_T006": [
+    {
+      "document_search_results": "Error executing tool search_stored_documents_rag: 1 validation error for search_stored_documents_ragArguments\ninput\n  Input should be a valid dictionary or instance of SearchDocumentsInput [type=model_type, input_value='Dubai finance sector dev... financial institutions', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.12/v/model_type"
+    }
+  ]
+}

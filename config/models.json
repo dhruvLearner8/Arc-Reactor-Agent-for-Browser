@@ -37,6 +37,31 @@
         "embed": "http://localhost:11434/api/embeddings"
       }
     },
+    "qwen2.5vl:32b": {
+      "type": "ollama",
+      "model": "qwen2.5vl:32b",
+      "embedding_model": "qwen2.5:32b-instruct-q4_0 ",
+      "url": {
+        "generate": "http://localhost:11434/api/generate",
+        "embed": "http://localhost:11434/api/embeddings"
+      }
+    },
+    "qwen2.5vl:latest": {
+      "type": "ollama",
+      "model": "qwen2.5vl:latest",
+      "url": {
+        "generate": "http://localhost:11434/api/generate",
+        "embed": "http://localhost:11434/api/embeddings"
+      }
+    },
+    "phi4-reasoning:14b": {
+      "type": "ollama",
+      "model": "phi4-reasoning:14b",
+      "url": {
+        "generate": "http://localhost:11434/api/generate",
+        "embed": "http://localhost:11434/api/embeddings"
+      }
+    },
     "nomic": {
       "type": "huggingface",
       "model": "nomic-ai/nomic-embed-text-v1",
