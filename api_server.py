@@ -5,11 +5,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from auth import AuthUser, get_current_user, verify_access_token
 from core.loop import AgentLoop4
 from mcp_servers.multi_mcp import MultiMCP
 
@@ -221,8 +222,13 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/me")
+async def me(current_user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    return {"user_id": current_user.user_id, "email": current_user.email}
+
+
 @app.get("/api/runs")
-async def list_runs() -> list[dict[str, Any]]:
+async def list_runs(current_user: AuthUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     active = []
     for run_id, run in RUNS.items():
         snapshot = run.get("snapshot", {})
@@ -256,7 +262,7 @@ async def list_runs() -> list[dict[str, Any]]:
 
 
 @app.get("/api/runs/{run_id}")
-async def get_run(run_id: str) -> dict[str, Any]:
+async def get_run(run_id: str, current_user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
     if run_id in RUNS and RUNS[run_id].get("snapshot"):
         return RUNS[run_id]["snapshot"]
 
@@ -282,7 +288,15 @@ async def get_run(run_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/runs/{run_id}/events")
-async def stream_run_events(run_id: str, request: Request) -> StreamingResponse:
+async def stream_run_events(
+    run_id: str,
+    request: Request,
+    access_token: str | None = None,
+) -> StreamingResponse:
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Missing access token for event stream")
+    await verify_access_token(access_token)
+
     if run_id not in RUNS:
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not active")
 
@@ -317,7 +331,10 @@ async def stream_run_events(run_id: str, request: Request) -> StreamingResponse:
 
 
 @app.post("/api/runs", response_model=RunCreateResponse)
-async def create_run(request: RunCreateRequest) -> RunCreateResponse:
+async def create_run(
+    request: RunCreateRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> RunCreateResponse:
     run_id = f"run_{uuid4().hex[:10]}"
     RUNS[run_id] = {
         "query": request.query,

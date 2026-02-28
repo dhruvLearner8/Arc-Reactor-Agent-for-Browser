@@ -51,6 +51,22 @@ body,
   gap: 8px;
 }
 
+.auth-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: #020617;
+}
+
+.auth-meta {
+  font-size: 12px;
+  color: #cbd5e1;
+  word-break: break-word;
+}
+
 .new-run-box textarea {
   width: 100%;
   border-radius: 8px;
@@ -252,5 +268,42 @@ button:disabled {
   color: #fecaca;
   padding: 10px 12px;
   font-size: 12px;
+}
+
+.login-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: #020617;
+  padding: 24px;
+}
+
+.login-card {
+  width: min(420px, 92vw);
+  border: 1px solid #334155;
+  border-radius: 12px;
+  background: #0b1220;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.login-card h1 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.login-card p {
+  margin: 0;
+  color: #cbd5e1;
+}
+
+.page-loading {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  color: #e2e8f0;
+  background: #020617;
 }
 

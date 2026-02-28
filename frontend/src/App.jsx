@@ -10,6 +10,7 @@ import ReactFlow, {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import TurndownService from "turndown";
+import { supabase } from "./lib/supabase";
 
 const statusColor = {
   pending: "#9ca3af",
@@ -222,6 +223,8 @@ function renderNodeOutput(node) {
 }
 
 export default function App() {
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [runs, setRuns] = useState([]);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [runDetail, setRunDetail] = useState(null);
@@ -233,6 +236,8 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [viewMode, setViewMode] = useState("rendered");
   const [inspectorExpanded, setInspectorExpanded] = useState(false);
+  const user = session?.user ?? null;
+  const accessToken = session?.access_token ?? "";
 
   const selectedNode = useMemo(
     () => runDetail?.nodes?.find((n) => n.id === selectedNodeId),
@@ -241,11 +246,29 @@ export default function App() {
 
   const flowData = useMemo(() => buildFlowData(runDetail), [runDetail]);
 
+  const getAuthHeaders = () =>
+    accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
+
+  async function signOut() {
+    setError("");
+    const { error: signOutError } = await supabase.auth.signOut();
+    if (signOutError) setError(signOutError.message);
+  }
+
   async function fetchRuns() {
+    if (!accessToken) {
+      setRuns([]);
+      setRunDetail(null);
+      setSelectedRunId("");
+      return;
+    }
     setLoadingRuns(true);
     setError("");
     try {
-      const res = await fetch("/api/runs");
+      const res = await fetch("/api/runs", { headers: getAuthHeaders() });
+      if (res.status === 401 || res.status === 403) {
+        throw new Error("Authentication required. Please sign in again.");
+      }
       const data = await res.json();
       setRuns(Array.isArray(data) ? data : []);
       if (!selectedRunId && Array.isArray(data) && data.length > 0) {
@@ -259,10 +282,10 @@ export default function App() {
   }
 
   async function fetchRunDetail(runId) {
-    if (!runId) return;
+    if (!runId || !accessToken) return;
     setError("");
     try {
-      const res = await fetch(`/api/runs/${runId}`);
+      const res = await fetch(`/api/runs/${runId}`, { headers: getAuthHeaders() });
       if (!res.ok) throw new Error(`Failed to load run ${runId}`);
       const data = await res.json();
       setRunDetail(data);
@@ -274,13 +297,17 @@ export default function App() {
   }
 
   async function createRun() {
+    if (!accessToken) {
+      setError("Please sign in with Google first.");
+      return;
+    }
     if (!query.trim()) return;
     setCreatingRun(true);
     setError("");
     try {
       const res = await fetch("/api/runs", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
         body: JSON.stringify({ query: query.trim() }),
       });
       if (!res.ok) {
@@ -299,19 +326,44 @@ export default function App() {
   }
 
   useEffect(() => {
-    fetchRuns();
+    let mounted = true;
+    supabase.auth
+      .getSession()
+      .then(({ data }) => {
+        if (!mounted) return;
+        setSession(data.session ?? null);
+      })
+      .finally(() => {
+        if (mounted) setAuthLoading(false);
+      });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession ?? null);
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
-    if (selectedRunId) fetchRunDetail(selectedRunId);
-  }, [selectedRunId]);
+    if (!authLoading) fetchRuns();
+  }, [accessToken, authLoading]);
 
   useEffect(() => {
-    if (!selectedRunId || !selectedRunId.startsWith("run_")) {
+    if (selectedRunId && accessToken) fetchRunDetail(selectedRunId);
+  }, [selectedRunId, accessToken]);
+
+  useEffect(() => {
+    if (!selectedRunId || !selectedRunId.startsWith("run_") || !accessToken) {
       setIsStreaming(false);
       return;
     }
-    const stream = new EventSource(`/api/runs/${selectedRunId}/events`);
+    const tokenParam = encodeURIComponent(accessToken);
+    const stream = new EventSource(`/api/runs/${selectedRunId}/events?access_token=${tokenParam}`);
     setIsStreaming(true);
 
     stream.addEventListener("run_update", (evt) => {
@@ -366,12 +418,24 @@ export default function App() {
       stream.close();
       setIsStreaming(false);
     };
-  }, [selectedRunId]);
+  }, [selectedRunId, accessToken]);
 
   return (
     <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""}`}>
       <aside className="left-panel">
         <h2>Runs</h2>
+        <div className="auth-box">
+          {authLoading ? (
+            <div className="auth-meta">Checking authentication...</div>
+          ) : user ? (
+            <>
+              <div className="auth-meta">Signed in as: {user.email || user.id}</div>
+              <button onClick={signOut}>Sign Out</button>
+            </>
+          ) : (
+            <div className="auth-meta">Not signed in</div>
+          )}
+        </div>
         <div className="new-run-box">
           <textarea
             rows={4}
