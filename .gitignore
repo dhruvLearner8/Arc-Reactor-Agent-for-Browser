@@ -56,3 +56,9 @@ mcp_servers/documents/*.gz
 # Gemini/Brain
 .gemini/
 
+# Runtime state / generated artifacts
+action/sandbox_state/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+

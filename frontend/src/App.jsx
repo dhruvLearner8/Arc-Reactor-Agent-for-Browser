@@ -8,6 +8,7 @@ import ReactFlow, {
   Position,
 } from "reactflow";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import TurndownService from "turndown";
 
 const statusColor = {
@@ -197,11 +198,26 @@ function renderNodeOutput(node) {
     }
   };
 
+  const normalizeMarkdownTables = (text) => {
+    if (typeof text !== "string" || !text.includes("|")) return text;
+    let normalized = text;
+
+    // Split header row and separator row when model emits:
+    // | h1 | h2 | |---|---|
+    normalized = normalized.replace(/\|\s+\|(?=\s*:?-{3,}:?\s*\|)/g, "|\n|");
+
+    // Split concatenated data rows in malformed one-line tables:
+    // | row1... | | row2... |
+    normalized = normalized.replace(/\|\s+\|(?=\s*[A-Za-z0-9(\["'])/g, "|\n|");
+
+    return normalized;
+  };
+
   const output = node.output;
   if (typeof output === "string") return normalizeString(output);
   if (!output) return "No output captured for this node.";
   const best = pickBestString(output);
-  if (best) return htmlToMarkdownIfNeeded(best);
+  if (best) return normalizeMarkdownTables(htmlToMarkdownIfNeeded(best));
   return `\`\`\`json\n${JSON.stringify(output, null, 2)}\n\`\`\``;
 }
 
@@ -453,7 +469,9 @@ export default function App() {
             </div>
             <div className="markdown-view">
               {viewMode === "rendered" ? (
-                <ReactMarkdown>{renderNodeOutput(selectedNode)}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {renderNodeOutput(selectedNode)}
+                </ReactMarkdown>
               ) : (
                 <pre>{JSON.stringify(selectedNode?.output ?? {}, null, 2)}</pre>
               )}

@@ -219,6 +219,28 @@ button:disabled {
   border: 1px solid #1e293b;
 }
 
+.markdown-view table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0;
+  display: block;
+  overflow-x: auto;
+}
+
+.markdown-view th,
+.markdown-view td {
+  border: 1px solid #334155;
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.markdown-view th {
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
 .empty {
   padding: 12px;
   color: #94a3b8;
