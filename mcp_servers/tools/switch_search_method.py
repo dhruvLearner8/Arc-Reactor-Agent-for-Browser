@@ -16,7 +16,6 @@ def print(*args, **kwargs):
 SEARCH_ENGINES = [
     "duck_http",
     "duck_playwright",
-    "bing_playwright",
     "yahoo_playwright",
     "ecosia_playwright",
     "mojeek_playwright"

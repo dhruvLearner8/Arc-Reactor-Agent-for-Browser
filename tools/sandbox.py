@@ -82,6 +82,55 @@ def fix_unterminated_triple_quotes(code: str) -> str:
         return code + '\n"""'
     return code
 
+def escape_inner_apostrophes_in_single_quotes(code: str) -> str:
+    """
+    Heuristic repair for model-generated code like:
+    'Harry Potter and the Sorcerer's Stone'
+    where apostrophes inside single-quoted literals are not escaped.
+    """
+    out = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(code)
+
+    while i < n:
+        ch = code[i]
+        prev_ch = code[i - 1] if i > 0 else ""
+        next_ch = code[i + 1] if i + 1 < n else ""
+
+        # Respect escaped chars
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(code[i + 1])
+            i += 2
+            continue
+
+        if not in_double and ch == "'":
+            if not in_single:
+                in_single = True
+                out.append(ch)
+            else:
+                # If apostrophe is between letters, keep string open and escape it.
+                if prev_ch.isalpha() and next_ch.isalpha():
+                    out.append("\\'")
+                else:
+                    in_single = False
+                    out.append(ch)
+            i += 1
+            continue
+
+        if not in_single and ch == '"':
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
 
 def build_safe_globals(mcp_funcs: dict, multi_mcp=None, session_id: str = None) -> dict:
     safe_globals = {
@@ -140,7 +189,11 @@ def load_session_vars(session_id: str) -> dict:
 
 
 def count_function_calls(code: str) -> int:
-    tree = ast.parse(code)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        repaired = escape_inner_apostrophes_in_single_quotes(code)
+        tree = ast.parse(repaired)
     return sum(isinstance(node, ast.Call) for node in ast.walk(tree))
 
 
@@ -177,6 +230,7 @@ async def run_user_code(code: str, multi_mcp, session_id: str = "default_session
         log_step(f"[CODE:]: {code}", symbol="🐍")
 
         cleaned_code = fix_unterminated_triple_quotes(textwrap.dedent(code.strip()))
+        cleaned_code = escape_inner_apostrophes_in_single_quotes(cleaned_code)
         tree = ast.parse(cleaned_code)
 
         # ─── AST Transformations ─────────────────────────────────────
