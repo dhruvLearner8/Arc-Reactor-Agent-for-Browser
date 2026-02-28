@@ -1,22 +1,27 @@
 import asyncio
 import json
+import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
-from auth import AuthUser, get_current_user, verify_access_token
+from auth import AuthUser, get_current_user
 from core.loop import AgentLoop4
 from mcp_servers.multi_mcp import MultiMCP
 
 
 BASE_DIR = Path(__file__).parent
 SESSIONS_DIR = BASE_DIR / "memory" / "session_summaries_index"
+load_dotenv(BASE_DIR / ".env")
 
 
 class RunCreateRequest(BaseModel):
@@ -40,6 +45,126 @@ app.add_middleware(
 )
 
 RUNS: dict[str, dict[str, Any]] = {}
+STREAM_TICKETS: dict[str, dict[str, Any]] = {}
+
+
+class SupabaseRunStore:
+    def __init__(self):
+        self.url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+        self.service_key = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+        self.enabled = bool(self.url and self.service_key)
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {
+            "apikey": self.service_key,
+            "Authorization": f"Bearer {self.service_key}",
+            "Content-Type": "application/json",
+        }
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        payload: dict[str, Any] | list[dict[str, Any]] | None = None,
+        prefer: str | None = None,
+    ) -> Any:
+        if not self.enabled:
+            return None
+        headers = dict(self._headers)
+        if prefer:
+            headers["Prefer"] = prefer
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.request(
+                method,
+                f"{self.url}{path}",
+                params=params,
+                json=payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            if not resp.content:
+                return None
+            ctype = resp.headers.get("content-type", "")
+            if "application/json" in ctype:
+                return resp.json()
+            return None
+
+    async def upsert_user(self, user_id: str, email: str | None) -> None:
+        if not self.enabled:
+            return
+        payload = [{
+            "id": user_id,
+            "email": email,
+            "last_seen_at": datetime.utcnow().isoformat(),
+        }]
+        await self._request(
+            "POST",
+            "/rest/v1/app_users",
+            params={"on_conflict": "id"},
+            payload=payload,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    async def upsert_run(self, run_data: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        payload = [{
+            "run_id": run_data["run_id"],
+            "owner_user_id": run_data["owner_user_id"],
+            "owner_email": run_data.get("owner_email"),
+            "query": run_data.get("query", ""),
+            "status": run_data.get("status", "running"),
+            "session_id": run_data.get("session_id"),
+            "summary": run_data.get("summary", {}) or {},
+            "latest_snapshot": run_data.get("latest_snapshot", {}) or {},
+            "created_at": run_data.get("created_at") or datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        }]
+        await self._request(
+            "POST",
+            "/rest/v1/chat_runs",
+            params={"on_conflict": "run_id"},
+            payload=payload,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    async def list_runs(self, user_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        rows = await self._request(
+            "GET",
+            "/rest/v1/chat_runs",
+            params={
+                "select": "run_id,query,status,created_at,session_id,latest_snapshot",
+                "owner_user_id": f"eq.{user_id}",
+                "order": "created_at.desc",
+                "limit": str(limit),
+            },
+        )
+        return rows if isinstance(rows, list) else []
+
+    async def get_run(self, run_id: str, user_id: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        rows = await self._request(
+            "GET",
+            "/rest/v1/chat_runs",
+            params={
+                "select": "run_id,query,status,created_at,session_id,latest_snapshot,summary",
+                "run_id": f"eq.{run_id}",
+                "owner_user_id": f"eq.{user_id}",
+                "limit": "1",
+            },
+        )
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return None
+
+
+RUN_STORE = SupabaseRunStore()
 
 
 def _load_session_file(path: Path) -> dict[str, Any]:
@@ -88,6 +213,24 @@ def _run_belongs_to_user(run: dict[str, Any] | None, user_id: str) -> bool:
     return bool(owner and owner == user_id)
 
 
+def _prune_stream_tickets() -> None:
+    now = time.time()
+    expired = [k for k, v in STREAM_TICKETS.items() if v.get("expires_at", 0) < now]
+    for k in expired:
+        STREAM_TICKETS.pop(k, None)
+
+
+def _issue_stream_ticket(run_id: str, user_id: str, ttl_seconds: int = 120) -> str:
+    _prune_stream_tickets()
+    ticket = f"st_{uuid4().hex}"
+    STREAM_TICKETS[ticket] = {
+        "run_id": run_id,
+        "user_id": user_id,
+        "expires_at": time.time() + ttl_seconds,
+    }
+    return ticket
+
+
 def _session_to_run_detail(payload: dict[str, Any]) -> dict[str, Any]:
     graph_meta = payload.get("graph", {})
     nodes = payload.get("nodes", [])
@@ -102,6 +245,55 @@ def _session_to_run_detail(payload: dict[str, Any]) -> dict[str, Any]:
         "nodes": nodes,
         "links": links,
         "globals_schema": globals_schema,
+    }
+
+
+def _db_row_to_run_list_item(row: dict[str, Any]) -> dict[str, Any]:
+    snapshot = row.get("latest_snapshot") if isinstance(row.get("latest_snapshot"), dict) else {}
+    nodes = snapshot.get("nodes", []) if isinstance(snapshot, dict) else []
+    return {
+        "run_id": row.get("run_id"),
+        "query": row.get("query", ""),
+        "created_at": row.get("created_at"),
+        "status": row.get("status", "unknown"),
+        "completed_steps": sum(1 for n in nodes if n.get("id") != "ROOT" and n.get("status") == "completed"),
+        "failed_steps": sum(1 for n in nodes if n.get("id") != "ROOT" and n.get("status") == "failed"),
+        "total_steps": sum(1 for n in nodes if n.get("id") != "ROOT"),
+        "session_id": row.get("session_id"),
+    }
+
+
+def _db_row_to_run_detail(row: dict[str, Any]) -> dict[str, Any]:
+    snapshot = row.get("latest_snapshot") if isinstance(row.get("latest_snapshot"), dict) else {}
+    detail = snapshot.copy() if isinstance(snapshot, dict) else {}
+    detail["run_id"] = row.get("run_id")
+    detail["query"] = row.get("query", detail.get("query", ""))
+    detail["created_at"] = row.get("created_at", detail.get("created_at"))
+    detail["status"] = row.get("status", detail.get("status", "unknown"))
+    detail["session_id"] = row.get("session_id", detail.get("session_id"))
+    if "nodes" not in detail:
+        detail["nodes"] = []
+    if "links" not in detail:
+        detail["links"] = []
+    if "globals_schema" not in detail:
+        detail["globals_schema"] = {}
+    return detail
+
+
+def _build_run_record(run_id: str) -> dict[str, Any] | None:
+    run = RUNS.get(run_id)
+    if not run:
+        return None
+    return {
+        "run_id": run_id,
+        "owner_user_id": run.get("owner_user_id"),
+        "owner_email": run.get("owner_email"),
+        "query": run.get("query", ""),
+        "status": run.get("status", "running"),
+        "session_id": run.get("session_id"),
+        "summary": run.get("summary", {}),
+        "latest_snapshot": run.get("snapshot", {}),
+        "created_at": run.get("created_at"),
     }
 
 
@@ -161,6 +353,9 @@ async def _watch_session_file(run_id: str, stop_event: asyncio.Event) -> None:
                 snapshot["session_id"] = session_id
                 snapshot["status"] = run.get("status", snapshot.get("status", "running"))
                 _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+                run_record = _build_run_record(run_id)
+                if run_record:
+                    await RUN_STORE.upsert_run(run_record)
         await asyncio.sleep(0.6)
 
 
@@ -169,6 +364,9 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
     stop_event = asyncio.Event()
     watcher_task = None
     RUNS[run_id]["status"] = "starting"
+    run_record = _build_run_record(run_id)
+    if run_record:
+        await RUN_STORE.upsert_run(run_record)
 
     try:
         await multi_mcp.start()
@@ -198,6 +396,9 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 bootstrap_snapshot["run_id"] = run_id
                 bootstrap_snapshot["session_id"] = session_id
                 _publish_event(run_id, {"snapshot": bootstrap_snapshot}, event="run_update")
+                run_record = _build_run_record(run_id)
+                if run_record:
+                    await RUN_STORE.upsert_run(run_record)
                 break
             if run_task.done():
                 break
@@ -228,10 +429,16 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
             {"status": "completed", "summary": summary, "snapshot": final_snapshot},
             event="run_complete",
         )
+        run_record = _build_run_record(run_id)
+        if run_record:
+            await RUN_STORE.upsert_run(run_record)
     except Exception as exc:
         RUNS[run_id]["status"] = "failed"
         RUNS[run_id]["error"] = str(exc)
         _publish_event(run_id, {"status": "failed", "error": str(exc)}, event="run_error")
+        run_record = _build_run_record(run_id)
+        if run_record:
+            await RUN_STORE.upsert_run(run_record)
     finally:
         stop_event.set()
         if watcher_task:
@@ -281,8 +488,12 @@ async def list_runs(current_user: AuthUser = Depends(get_current_user)) -> list[
             }
         )
 
-    persisted = []
-    if SESSIONS_DIR.exists():
+    persisted: list[dict[str, Any]] = []
+    db_rows = await RUN_STORE.list_runs(current_user.user_id)
+    persisted.extend(_db_row_to_run_list_item(row) for row in db_rows)
+
+    # Backward-compatible fallback for local/dev mode when DB store is disabled.
+    if not RUN_STORE.enabled and SESSIONS_DIR.exists():
         files = sorted(SESSIONS_DIR.rglob("session_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
         for path in files:
             payload = _load_session_file(path)
@@ -290,7 +501,17 @@ async def list_runs(current_user: AuthUser = Depends(get_current_user)) -> list[
                 continue
             persisted.append(_session_to_run_list_item(path))
 
-    return sorted(active, key=lambda r: (r.get("created_at") or ""), reverse=True) + persisted
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in persisted:
+        rid = item.get("run_id")
+        if rid:
+            by_id[rid] = item
+    for item in active:
+        rid = item.get("run_id")
+        if rid:
+            by_id[rid] = item
+
+    return sorted(by_id.values(), key=lambda r: (r.get("created_at") or ""), reverse=True)
 
 
 @app.get("/api/runs/{run_id}")
@@ -300,13 +521,19 @@ async def get_run(run_id: str, current_user: AuthUser = Depends(get_current_user
             raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
         return RUNS[run_id]["snapshot"]
 
-    # Accept session id for persisted runs too.
-    run_file = _find_run_file(run_id)
-    if run_file:
-        payload = _load_session_file(run_file)
-        if _session_owner_id(payload) != current_user.user_id:
-            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
-        return _session_to_run_detail(payload)
+    # DB-backed persisted history.
+    db_row = await RUN_STORE.get_run(run_id, current_user.user_id)
+    if db_row:
+        return _db_row_to_run_detail(db_row)
+
+    # Backward-compatible fallback for local/dev mode when DB store is disabled.
+    if not RUN_STORE.enabled:
+        run_file = _find_run_file(run_id)
+        if run_file:
+            payload = _load_session_file(run_file)
+            if _session_owner_id(payload) != current_user.user_id:
+                raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+            return _session_to_run_detail(payload)
 
     # Fallback: if temporary run id has mapped session id, try that.
     run = RUNS.get(run_id)
@@ -327,19 +554,38 @@ async def get_run(run_id: str, current_user: AuthUser = Depends(get_current_user
     raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
 
 
+@app.post("/api/runs/{run_id}/stream-ticket")
+async def create_stream_ticket(
+    run_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    if run_id not in RUNS:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not active")
+    if not _run_belongs_to_user(RUNS.get(run_id), current_user.user_id):
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+    ticket = _issue_stream_ticket(run_id, current_user.user_id)
+    return {"ticket": ticket, "expires_in": 120}
+
+
 @app.get("/api/runs/{run_id}/events")
 async def stream_run_events(
     run_id: str,
     request: Request,
-    access_token: str | None = None,
+    ticket: str | None = None,
 ) -> StreamingResponse:
-    if not access_token:
-        raise HTTPException(status_code=401, detail="Missing access token for event stream")
-    user = await verify_access_token(access_token)
+    _prune_stream_tickets()
+    if not ticket:
+        raise HTTPException(status_code=401, detail="Missing stream ticket")
+    ticket_payload = STREAM_TICKETS.pop(ticket, None)
+    if not ticket_payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired stream ticket")
+    if ticket_payload.get("run_id") != run_id:
+        raise HTTPException(status_code=401, detail="Stream ticket does not match run")
+    user_id = ticket_payload.get("user_id")
 
     if run_id not in RUNS:
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not active")
-    if not _run_belongs_to_user(RUNS.get(run_id), user.user_id):
+    if not _run_belongs_to_user(RUNS.get(run_id), user_id):
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
 
     queue: asyncio.Queue = asyncio.Queue()
@@ -405,6 +651,10 @@ async def create_run(
         "owner_user_id": current_user.user_id,
         "owner_email": current_user.email,
     }
+    await RUN_STORE.upsert_user(current_user.user_id, current_user.email)
+    run_record = _build_run_record(run_id)
+    if run_record:
+        await RUN_STORE.upsert_run(run_record)
     asyncio.create_task(_execute_run(run_id, request.query, current_user.user_id, current_user.email))
     return RunCreateResponse(run_id=run_id, status="running", summary={})
 

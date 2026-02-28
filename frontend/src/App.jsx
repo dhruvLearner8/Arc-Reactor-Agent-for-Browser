@@ -51,10 +51,11 @@ function AgentNode({ data }) {
 
 const nodeTypes = { agentNode: AgentNode };
 
-function buildFlowData(run) {
+function buildFlowData(run, theme = "dark") {
   if (!run) return { nodes: [], edges: [] };
   const rawNodes = run.nodes ?? [];
   const rawEdges = run.links ?? [];
+  const isLight = theme === "light";
 
   const ids = new Set(rawNodes.map((n) => n.id));
   const incoming = new Map();
@@ -125,8 +126,8 @@ function buildFlowData(run) {
             borderRadius: 12,
             border: `2px solid ${statusColor[status] ?? "#6b7280"}`,
             padding: 10,
-            background: "#0f172a",
-            color: "#f8fafc",
+            background: isLight ? "#ffffff" : "#0f172a",
+            color: isLight ? "#0f172a" : "#f8fafc",
           },
         });
       });
@@ -223,6 +224,11 @@ function renderNodeOutput(node) {
 }
 
 export default function App() {
+  const [theme, setTheme] = useState(() => {
+    if (typeof window === "undefined") return "dark";
+    const saved = window.localStorage.getItem("app_theme");
+    return saved === "light" ? "light" : "dark";
+  });
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [runs, setRuns] = useState([]);
@@ -236,7 +242,6 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [viewMode, setViewMode] = useState("rendered");
   const [inspectorExpanded, setInspectorExpanded] = useState(false);
-  const user = session?.user ?? null;
   const accessToken = session?.access_token ?? "";
 
   const selectedNode = useMemo(
@@ -244,7 +249,7 @@ export default function App() {
     [runDetail, selectedNodeId]
   );
 
-  const flowData = useMemo(() => buildFlowData(runDetail), [runDetail]);
+  const flowData = useMemo(() => buildFlowData(runDetail, theme), [runDetail, theme]);
 
   const getAuthHeaders = () =>
     accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
@@ -253,6 +258,10 @@ export default function App() {
     setError("");
     const { error: signOutError } = await supabase.auth.signOut();
     if (signOutError) setError(signOutError.message);
+  }
+
+  function toggleTheme() {
+    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
   }
 
   async function fetchRuns() {
@@ -354,6 +363,11 @@ export default function App() {
   }, [accessToken, authLoading]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("app_theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
     if (selectedRunId && accessToken) fetchRunDetail(selectedRunId);
   }, [selectedRunId, accessToken]);
 
@@ -362,80 +376,102 @@ export default function App() {
       setIsStreaming(false);
       return;
     }
-    const tokenParam = encodeURIComponent(accessToken);
-    const stream = new EventSource(`/api/runs/${selectedRunId}/events?access_token=${tokenParam}`);
-    setIsStreaming(true);
+    let stream = null;
+    let cancelled = false;
 
-    stream.addEventListener("run_update", (evt) => {
+    const initStream = async () => {
       try {
-        const payload = JSON.parse(evt.data);
-        if (payload?.snapshot) {
-          setRunDetail(payload.snapshot);
-          const running = runs.find((r) => r.run_id === selectedRunId);
-          if (!selectedNodeId && payload.snapshot.nodes?.length) {
-            const firstNode = payload.snapshot.nodes.find((n) => n.id !== "ROOT");
-            setSelectedNodeId(firstNode?.id ?? "ROOT");
-          } else if (running?.status === "running") {
-            const activeNode = payload.snapshot.nodes?.find((n) => n.status === "running");
-            if (activeNode) setSelectedNodeId(activeNode.id);
-          }
+        const ticketRes = await fetch(`/api/runs/${selectedRunId}/stream-ticket`, {
+          method: "POST",
+          headers: getAuthHeaders(),
+        });
+        if (!ticketRes.ok) {
+          throw new Error("Failed to open stream (ticket denied)");
         }
-      } catch {
-        // no-op
-      }
-    });
+        const ticketData = await ticketRes.json();
+        if (cancelled) return;
+        const ticketParam = encodeURIComponent(ticketData.ticket);
+        stream = new EventSource(`/api/runs/${selectedRunId}/events?ticket=${ticketParam}`);
+        setIsStreaming(true);
 
-    stream.addEventListener("run_complete", (evt) => {
-      try {
-        const payload = JSON.parse(evt.data);
-        if (payload?.snapshot) setRunDetail(payload.snapshot);
-      } catch {
-        // no-op
-      }
-      setIsStreaming(false);
-      fetchRuns();
-      stream.close();
-    });
+        stream.addEventListener("run_update", (evt) => {
+          try {
+            const payload = JSON.parse(evt.data);
+            if (payload?.snapshot) {
+              setRunDetail(payload.snapshot);
+              const running = runs.find((r) => r.run_id === selectedRunId);
+              if (!selectedNodeId && payload.snapshot.nodes?.length) {
+                const firstNode = payload.snapshot.nodes.find((n) => n.id !== "ROOT");
+                setSelectedNodeId(firstNode?.id ?? "ROOT");
+              } else if (running?.status === "running") {
+                const activeNode = payload.snapshot.nodes?.find((n) => n.status === "running");
+                if (activeNode) setSelectedNodeId(activeNode.id);
+              }
+            }
+          } catch {
+            // no-op
+          }
+        });
 
-    stream.addEventListener("run_error", (evt) => {
-      try {
-        const payload = JSON.parse(evt.data);
-        setError(payload?.error || "Run failed");
-      } catch {
-        setError("Run failed");
-      }
-      setIsStreaming(false);
-      fetchRuns();
-      stream.close();
-    });
+        stream.addEventListener("run_complete", (evt) => {
+          try {
+            const payload = JSON.parse(evt.data);
+            if (payload?.snapshot) setRunDetail(payload.snapshot);
+          } catch {
+            // no-op
+          }
+          setIsStreaming(false);
+          fetchRuns();
+          stream?.close();
+        });
 
-    stream.onerror = () => {
-      setIsStreaming(false);
-      stream.close();
+        stream.addEventListener("run_error", (evt) => {
+          try {
+            const payload = JSON.parse(evt.data);
+            setError(payload?.error || "Run failed");
+          } catch {
+            setError("Run failed");
+          }
+          setIsStreaming(false);
+          fetchRuns();
+          stream?.close();
+        });
+
+        stream.onerror = () => {
+          setIsStreaming(false);
+          stream?.close();
+        };
+      } catch (e) {
+        setIsStreaming(false);
+        setError(String(e));
+      }
     };
+    initStream();
 
     return () => {
-      stream.close();
+      cancelled = true;
+      stream?.close();
       setIsStreaming(false);
     };
   }, [selectedRunId, accessToken]);
 
   return (
-    <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""}`}>
-      <aside className="left-panel">
-        <h2>Runs</h2>
-        <div className="auth-box">
-          {authLoading ? (
-            <div className="auth-meta">Checking authentication...</div>
-          ) : user ? (
-            <>
-              <div className="auth-meta">Signed in as: {user.email || user.id}</div>
-              <button onClick={signOut}>Sign Out</button>
-            </>
-          ) : (
-            <div className="auth-meta">Not signed in</div>
-          )}
+    <div className={`app-page theme-${theme}`}>
+      <header className="top-nav">
+        <div className="brand-title">ArcReactor Agent</div>
+        <div className="top-nav-actions">
+          <button onClick={toggleTheme}>
+            {theme === "dark" ? "Light Theme" : "Dark Theme"}
+          </button>
+          <button onClick={signOut} disabled={authLoading || !accessToken}>
+            Sign Out
+          </button>
         </div>
+      </header>
+
+      <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""}`}>
+        <aside className="left-panel">
+        <h2>Runs</h2>
         <div className="new-run-box">
           <textarea
             rows={4}
@@ -465,87 +501,88 @@ export default function App() {
             </button>
           ))}
         </div>
-      </aside>
+        </aside>
 
-      <main className="graph-panel">
-        <div className="panel-title">Execution Graph</div>
-        {isStreaming ? <div className="live-pill">Live</div> : null}
-        <ReactFlow
-          nodes={flowData.nodes}
-          edges={flowData.edges}
-          nodeTypes={nodeTypes}
-          fitView
-          onNodeClick={(_, node) => setSelectedNodeId(node.id)}
-        >
-          <MiniMap />
-          <Controls />
-          <Background />
-        </ReactFlow>
-      </main>
-
-      <aside className="right-panel">
-        <div className="panel-title inspector-title">
-          <span>Inspector</span>
-          <button
-            className="inspector-toggle-btn"
-            onClick={() => setInspectorExpanded((v) => !v)}
+        <main className="graph-panel">
+          <div className="panel-title">Execution Graph</div>
+          {isStreaming ? <div className="live-pill">Live</div> : null}
+          <ReactFlow
+            nodes={flowData.nodes}
+            edges={flowData.edges}
+            nodeTypes={nodeTypes}
+            fitView
+            onNodeClick={(_, node) => setSelectedNodeId(node.id)}
           >
-            {inspectorExpanded ? "Collapse" : "Expand"}
-          </button>
-        </div>
-        {runDetail ? (
-          <>
-            <div className="run-header">
-              <div>
-                <strong>Run:</strong> #{runDetail.run_id}
+            <MiniMap />
+            <Controls />
+            <Background />
+          </ReactFlow>
+        </main>
+
+        <aside className="right-panel">
+          <div className="panel-title inspector-title">
+            <span>Inspector</span>
+            <button
+              className="inspector-toggle-btn"
+              onClick={() => setInspectorExpanded((v) => !v)}
+            >
+              {inspectorExpanded ? "Collapse" : "Expand"}
+            </button>
+          </div>
+          {runDetail ? (
+            <>
+              <div className="run-header">
+                <div>
+                  <strong>Run:</strong> #{runDetail.run_id}
+                </div>
+                <div>
+                  <strong>Status:</strong> {runDetail.status}
+                </div>
               </div>
-              <div>
-                <strong>Status:</strong> {runDetail.status}
+              <div className="node-meta">
+                <div>
+                  <strong>Node:</strong> {selectedNode?.id ?? "-"}
+                </div>
+                <div>
+                  <strong>Agent:</strong> {selectedNode?.agent ?? "-"}
+                </div>
+                <div>
+                  <strong>Reads:</strong> {(selectedNode?.reads ?? []).join(", ") || "-"}
+                </div>
+                <div>
+                  <strong>Writes:</strong> {(selectedNode?.writes ?? []).join(", ") || "-"}
+                </div>
               </div>
-            </div>
-            <div className="node-meta">
-              <div>
-                <strong>Node:</strong> {selectedNode?.id ?? "-"}
+              <div className="output-tabs">
+                <button
+                  className={viewMode === "rendered" ? "active-tab" : ""}
+                  onClick={() => setViewMode("rendered")}
+                >
+                  Rendered
+                </button>
+                <button
+                  className={viewMode === "json" ? "active-tab" : ""}
+                  onClick={() => setViewMode("json")}
+                >
+                  JSON
+                </button>
               </div>
-              <div>
-                <strong>Agent:</strong> {selectedNode?.agent ?? "-"}
+              <div className="markdown-view">
+                {viewMode === "rendered" ? (
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {renderNodeOutput(selectedNode)}
+                  </ReactMarkdown>
+                ) : (
+                  <pre>{JSON.stringify(selectedNode?.output ?? {}, null, 2)}</pre>
+                )}
               </div>
-              <div>
-                <strong>Reads:</strong> {(selectedNode?.reads ?? []).join(", ") || "-"}
-              </div>
-              <div>
-                <strong>Writes:</strong> {(selectedNode?.writes ?? []).join(", ") || "-"}
-              </div>
-            </div>
-            <div className="output-tabs">
-              <button
-                className={viewMode === "rendered" ? "active-tab" : ""}
-                onClick={() => setViewMode("rendered")}
-              >
-                Rendered
-              </button>
-              <button
-                className={viewMode === "json" ? "active-tab" : ""}
-                onClick={() => setViewMode("json")}
-              >
-                JSON
-              </button>
-            </div>
-            <div className="markdown-view">
-              {viewMode === "rendered" ? (
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {renderNodeOutput(selectedNode)}
-                </ReactMarkdown>
-              ) : (
-                <pre>{JSON.stringify(selectedNode?.output ?? {}, null, 2)}</pre>
-              )}
-            </div>
-          </>
-        ) : (
-          <div className="empty">Select a run to view details.</div>
-        )}
-        {error ? <div className="error-box">{error}</div> : null}
-      </aside>
+            </>
+          ) : (
+            <div className="empty">Select a run to view details.</div>
+          )}
+          {error ? <div className="error-box">{error}</div> : null}
+        </aside>
+      </div>
     </div>
   );
 }
