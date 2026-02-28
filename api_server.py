@@ -163,6 +163,48 @@ class SupabaseRunStore:
             return rows[0]
         return None
 
+    async def insert_log(
+        self,
+        *,
+        level: str,
+        event_type: str,
+        message: str,
+        owner_user_id: str | None = None,
+        run_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        log_payload = [{
+            "level": level,
+            "event_type": event_type,
+            "message": message,
+            "owner_user_id": owner_user_id,
+            "run_id": run_id,
+            "payload": payload or {},
+            "created_at": datetime.utcnow().isoformat(),
+        }]
+        await self._request(
+            "POST",
+            "/rest/v1/app_logs",
+            payload=log_payload,
+            prefer="return=minimal",
+        )
+
+    async def list_logs(self, limit: int = 500) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        rows = await self._request(
+            "GET",
+            "/rest/v1/app_logs",
+            params={
+                "select": "id,level,event_type,message,owner_user_id,run_id,payload,created_at",
+                "order": "created_at.desc",
+                "limit": str(limit),
+            },
+        )
+        return rows if isinstance(rows, list) else []
+
 
 RUN_STORE = SupabaseRunStore()
 
@@ -211,6 +253,14 @@ def _run_belongs_to_user(run: dict[str, Any] | None, user_id: str) -> bool:
         return False
     owner = run.get("owner_user_id")
     return bool(owner and owner == user_id)
+
+
+def _is_admin_user(user_id: str) -> bool:
+    raw = (os.getenv("ADMIN_USER_IDS") or "").strip()
+    if not raw:
+        return False
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    return user_id in allowed
 
 
 def _prune_stream_tickets() -> None:
@@ -367,6 +417,14 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
     run_record = _build_run_record(run_id)
     if run_record:
         await RUN_STORE.upsert_run(run_record)
+    await RUN_STORE.insert_log(
+        level="INFO",
+        event_type="run_started",
+        message="Run execution started",
+        owner_user_id=owner_user_id,
+        run_id=run_id,
+        payload={"query": query},
+    )
 
     try:
         await multi_mcp.start()
@@ -404,17 +462,22 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 break
             await asyncio.sleep(0.1)
 
-        watcher_task = asyncio.create_task(_watch_session_file(run_id, stop_event))
+        save_local_sessions = (os.getenv("SAVE_LOCAL_SESSIONS") or "1").strip().lower() not in {
+            "0", "false", "off", "no"
+        }
+        if save_local_sessions:
+            watcher_task = asyncio.create_task(_watch_session_file(run_id, stop_event))
 
         context = await run_task
         context.plan_graph.graph["owner_user_id"] = owner_user_id
         if owner_email:
             context.plan_graph.graph["owner_email"] = owner_email
-        # Persist owner metadata to session file immediately.
-        try:
-            context._auto_save()
-        except Exception:
-            pass
+        # Persist owner metadata to session file only when local saving enabled.
+        if save_local_sessions:
+            try:
+                context._auto_save()
+            except Exception:
+                pass
         summary = context.get_execution_summary()
         session_id = str(summary.get("session_id"))
         RUNS[run_id]["session_id"] = session_id
@@ -429,6 +492,14 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
             {"status": "completed", "summary": summary, "snapshot": final_snapshot},
             event="run_complete",
         )
+        await RUN_STORE.insert_log(
+            level="INFO",
+            event_type="run_completed",
+            message="Run execution completed",
+            owner_user_id=owner_user_id,
+            run_id=run_id,
+            payload={"session_id": session_id, "status": "completed"},
+        )
         run_record = _build_run_record(run_id)
         if run_record:
             await RUN_STORE.upsert_run(run_record)
@@ -436,6 +507,14 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
         RUNS[run_id]["status"] = "failed"
         RUNS[run_id]["error"] = str(exc)
         _publish_event(run_id, {"status": "failed", "error": str(exc)}, event="run_error")
+        await RUN_STORE.insert_log(
+            level="ERROR",
+            event_type="run_failed",
+            message="Run execution failed",
+            owner_user_id=owner_user_id,
+            run_id=run_id,
+            payload={"error": str(exc)},
+        )
         run_record = _build_run_record(run_id)
         if run_record:
             await RUN_STORE.upsert_run(run_record)
@@ -458,6 +537,16 @@ async def health() -> dict[str, str]:
 @app.get("/api/me")
 async def me(current_user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
     return {"user_id": current_user.user_id, "email": current_user.email}
+
+
+@app.get("/api/admin/logs")
+async def admin_logs(
+    limit: int = 500,
+    current_user: AuthUser = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    if not _is_admin_user(current_user.user_id):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return await RUN_STORE.list_logs(limit=max(1, min(limit, 2000)))
 
 
 @app.get("/api/runs")
@@ -492,15 +581,6 @@ async def list_runs(current_user: AuthUser = Depends(get_current_user)) -> list[
     db_rows = await RUN_STORE.list_runs(current_user.user_id)
     persisted.extend(_db_row_to_run_list_item(row) for row in db_rows)
 
-    # Backward-compatible fallback for local/dev mode when DB store is disabled.
-    if not RUN_STORE.enabled and SESSIONS_DIR.exists():
-        files = sorted(SESSIONS_DIR.rglob("session_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for path in files:
-            payload = _load_session_file(path)
-            if _session_owner_id(payload) != current_user.user_id:
-                continue
-            persisted.append(_session_to_run_list_item(path))
-
     by_id: dict[str, dict[str, Any]] = {}
     for item in persisted:
         rid = item.get("run_id")
@@ -525,31 +605,6 @@ async def get_run(run_id: str, current_user: AuthUser = Depends(get_current_user
     db_row = await RUN_STORE.get_run(run_id, current_user.user_id)
     if db_row:
         return _db_row_to_run_detail(db_row)
-
-    # Backward-compatible fallback for local/dev mode when DB store is disabled.
-    if not RUN_STORE.enabled:
-        run_file = _find_run_file(run_id)
-        if run_file:
-            payload = _load_session_file(run_file)
-            if _session_owner_id(payload) != current_user.user_id:
-                raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
-            return _session_to_run_detail(payload)
-
-    # Fallback: if temporary run id has mapped session id, try that.
-    run = RUNS.get(run_id)
-    if run and run.get("session_id"):
-        if not _run_belongs_to_user(run, current_user.user_id):
-            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
-        run_file = _find_run_file(run["session_id"])
-        if run_file:
-            payload = _load_session_file(run_file)
-            if _session_owner_id(payload) != current_user.user_id:
-                raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
-            detail = _session_to_run_detail(payload)
-            detail["run_id"] = run_id
-            detail["session_id"] = run["session_id"]
-            detail["status"] = run.get("status", detail.get("status", "unknown"))
-            return detail
 
     raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
 
@@ -655,6 +710,14 @@ async def create_run(
     run_record = _build_run_record(run_id)
     if run_record:
         await RUN_STORE.upsert_run(run_record)
+    await RUN_STORE.insert_log(
+        level="INFO",
+        event_type="run_created",
+        message="Run created",
+        owner_user_id=current_user.user_id,
+        run_id=run_id,
+        payload={"query": request.query},
+    )
     asyncio.create_task(_execute_run(run_id, request.query, current_user.user_id, current_user.email))
     return RunCreateResponse(run_id=run_id, status="running", summary={})
 
