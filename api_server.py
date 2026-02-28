@@ -75,6 +75,19 @@ def _session_to_run_list_item(path: Path) -> dict[str, Any]:
     }
 
 
+def _session_owner_id(payload: dict[str, Any]) -> str | None:
+    graph_meta = payload.get("graph", {})
+    owner = graph_meta.get("owner_user_id")
+    return str(owner) if owner else None
+
+
+def _run_belongs_to_user(run: dict[str, Any] | None, user_id: str) -> bool:
+    if not run:
+        return False
+    owner = run.get("owner_user_id")
+    return bool(owner and owner == user_id)
+
+
 def _session_to_run_detail(payload: dict[str, Any]) -> dict[str, Any]:
     graph_meta = payload.get("graph", {})
     nodes = payload.get("nodes", [])
@@ -151,7 +164,7 @@ async def _watch_session_file(run_id: str, stop_event: asyncio.Event) -> None:
         await asyncio.sleep(0.6)
 
 
-async def _execute_run(run_id: str, query: str) -> None:
+async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email: str | None) -> None:
     multi_mcp = MultiMCP()
     stop_event = asyncio.Event()
     watcher_task = None
@@ -174,6 +187,11 @@ async def _execute_run(run_id: str, query: str) -> None:
         for _ in range(20):
             if loop.bootstrap_context:
                 session_id = loop.bootstrap_context.plan_graph.graph.get("session_id")
+                # Stamp owner onto graph metadata as early as possible so
+                # persisted session files are user-scoped.
+                loop.bootstrap_context.plan_graph.graph["owner_user_id"] = owner_user_id
+                if owner_email:
+                    loop.bootstrap_context.plan_graph.graph["owner_email"] = owner_email
                 RUNS[run_id]["session_id"] = session_id
                 RUNS[run_id]["status"] = "running"
                 bootstrap_snapshot = _context_to_run_detail(loop.bootstrap_context, status="running")
@@ -188,6 +206,14 @@ async def _execute_run(run_id: str, query: str) -> None:
         watcher_task = asyncio.create_task(_watch_session_file(run_id, stop_event))
 
         context = await run_task
+        context.plan_graph.graph["owner_user_id"] = owner_user_id
+        if owner_email:
+            context.plan_graph.graph["owner_email"] = owner_email
+        # Persist owner metadata to session file immediately.
+        try:
+            context._auto_save()
+        except Exception:
+            pass
         summary = context.get_execution_summary()
         session_id = str(summary.get("session_id"))
         RUNS[run_id]["session_id"] = session_id
@@ -231,6 +257,8 @@ async def me(current_user: AuthUser = Depends(get_current_user)) -> dict[str, An
 async def list_runs(current_user: AuthUser = Depends(get_current_user)) -> list[dict[str, Any]]:
     active = []
     for run_id, run in RUNS.items():
+        if not _run_belongs_to_user(run, current_user.user_id):
+            continue
         snapshot = run.get("snapshot", {})
         active.append(
             {
@@ -256,7 +284,11 @@ async def list_runs(current_user: AuthUser = Depends(get_current_user)) -> list[
     persisted = []
     if SESSIONS_DIR.exists():
         files = sorted(SESSIONS_DIR.rglob("session_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        persisted = [_session_to_run_list_item(path) for path in files]
+        for path in files:
+            payload = _load_session_file(path)
+            if _session_owner_id(payload) != current_user.user_id:
+                continue
+            persisted.append(_session_to_run_list_item(path))
 
     return sorted(active, key=lambda r: (r.get("created_at") or ""), reverse=True) + persisted
 
@@ -264,20 +296,28 @@ async def list_runs(current_user: AuthUser = Depends(get_current_user)) -> list[
 @app.get("/api/runs/{run_id}")
 async def get_run(run_id: str, current_user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
     if run_id in RUNS and RUNS[run_id].get("snapshot"):
+        if not _run_belongs_to_user(RUNS.get(run_id), current_user.user_id):
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
         return RUNS[run_id]["snapshot"]
 
     # Accept session id for persisted runs too.
     run_file = _find_run_file(run_id)
     if run_file:
         payload = _load_session_file(run_file)
+        if _session_owner_id(payload) != current_user.user_id:
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
         return _session_to_run_detail(payload)
 
     # Fallback: if temporary run id has mapped session id, try that.
     run = RUNS.get(run_id)
     if run and run.get("session_id"):
+        if not _run_belongs_to_user(run, current_user.user_id):
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
         run_file = _find_run_file(run["session_id"])
         if run_file:
             payload = _load_session_file(run_file)
+            if _session_owner_id(payload) != current_user.user_id:
+                raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
             detail = _session_to_run_detail(payload)
             detail["run_id"] = run_id
             detail["session_id"] = run["session_id"]
@@ -295,10 +335,12 @@ async def stream_run_events(
 ) -> StreamingResponse:
     if not access_token:
         raise HTTPException(status_code=401, detail="Missing access token for event stream")
-    await verify_access_token(access_token)
+    user = await verify_access_token(access_token)
 
     if run_id not in RUNS:
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not active")
+    if not _run_belongs_to_user(RUNS.get(run_id), user.user_id):
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
 
     queue: asyncio.Queue = asyncio.Queue()
     RUNS[run_id].setdefault("subscribers", set()).add(queue)
@@ -360,7 +402,9 @@ async def create_run(
         },
         "subscribers": set(),
         "session_id": None,
+        "owner_user_id": current_user.user_id,
+        "owner_email": current_user.email,
     }
-    asyncio.create_task(_execute_run(run_id, request.query))
+    asyncio.create_task(_execute_run(run_id, request.query, current_user.user_id, current_user.email))
     return RunCreateResponse(run_id=run_id, status="running", summary={})
 

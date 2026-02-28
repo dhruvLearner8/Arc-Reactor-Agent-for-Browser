@@ -39,4 +39,5 @@ dependencies = [
     "beautifulsoup4>=4.13.4",
     "aiohttp>=3.11.18",
     "gradio>=6.7.0",
+    "python-jose[cryptography]>=3.5.0",
 ]
