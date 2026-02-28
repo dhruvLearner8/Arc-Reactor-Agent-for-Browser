@@ -39,6 +39,8 @@ memory/session_summaries_index/
 
 # RAG & Documents (Large files)
 mcp_servers/faiss_index/
+mcp_servers/faiss_index/**
+mcp_servers/documents/**
 mcp_servers/documents/*.pdf
 mcp_servers/documents/*.docx
 mcp_servers/documents/*.doc
@@ -51,13 +53,18 @@ mcp_servers/documents/*.tar
 mcp_servers/documents/*.gz
 
 # Retain keep files if necessary (optional strategy)
-# !mcp_servers/documents/.gitkeep
+!mcp_servers/faiss_index/
+!mcp_servers/documents/.gitkeep
+!mcp_servers/faiss_index/.gitkeep
 
 # Gemini/Brain
 .gemini/
 
 # Runtime state / generated artifacts
 action/sandbox_state/
+action/sandbox_state/**
+!action/sandbox_state/
+!action/sandbox_state/.gitkeep
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
