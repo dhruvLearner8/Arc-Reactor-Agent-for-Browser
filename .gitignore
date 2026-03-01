@@ -26,6 +26,7 @@ pip-delete-this-directory.txt
 *.zip
 *.tar
 *.gz
+!assets/arc-reactor-hero.png
 
 # Mac
 .DS_Store

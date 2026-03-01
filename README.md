@@ -1,5 +1,9 @@
 # Arc Reactor - Multi-Agent DAG Architecture
 
+<p align="center">
+  <img src="./assets/arc-reactor-hero.png" alt="Arc Reactor Agent Hero Banner" width="860" />
+</p>
+
 Arc Reactor is a production-oriented multi-agent system built around a directed acyclic graph (DAG) execution model.  
 It combines a FastAPI backend, a React/ReactFlow frontend, MCP tool servers, and session-aware persistence for replayable run histories.
 
