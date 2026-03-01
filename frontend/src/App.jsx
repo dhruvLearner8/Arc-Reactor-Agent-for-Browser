@@ -20,6 +20,8 @@ const statusColor = {
 };
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/+$/, "");
+const apiUrl = (path) => (API_BASE_URL ? `${API_BASE_URL}${path}` : path);
 
 function statusSubtitle(node) {
   const agent = (node.agent || "").toLowerCase();
@@ -254,6 +256,17 @@ export default function App() {
   const getAuthHeaders = () =>
     accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
 
+  async function readErrorMessage(res, fallback) {
+    const raw = await res.text();
+    if (!raw) return fallback;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed?.detail || parsed?.message || fallback;
+    } catch {
+      return raw;
+    }
+  }
+
   async function signOut() {
     setError("");
     const { error: signOutError } = await supabase.auth.signOut();
@@ -274,9 +287,13 @@ export default function App() {
     setLoadingRuns(true);
     setError("");
     try {
-      const res = await fetch("/api/runs", { headers: getAuthHeaders() });
+      const res = await fetch(apiUrl("/api/runs"), { headers: getAuthHeaders() });
       if (res.status === 401 || res.status === 403) {
         throw new Error("Authentication required. Please sign in again.");
+      }
+      if (!res.ok) {
+        const detail = await readErrorMessage(res, "Failed to load runs");
+        throw new Error(detail);
       }
       const data = await res.json();
       setRuns(Array.isArray(data) ? data : []);
@@ -294,8 +311,11 @@ export default function App() {
     if (!runId || !accessToken) return;
     setError("");
     try {
-      const res = await fetch(`/api/runs/${runId}`, { headers: getAuthHeaders() });
-      if (!res.ok) throw new Error(`Failed to load run ${runId}`);
+      const res = await fetch(apiUrl(`/api/runs/${runId}`), { headers: getAuthHeaders() });
+      if (!res.ok) {
+        const detail = await readErrorMessage(res, `Failed to load run ${runId}`);
+        throw new Error(detail);
+      }
       const data = await res.json();
       setRunDetail(data);
       const firstNode = (data.nodes ?? []).find((n) => n.id !== "ROOT");
@@ -314,14 +334,14 @@ export default function App() {
     setCreatingRun(true);
     setError("");
     try {
-      const res = await fetch("/api/runs", {
+      const res = await fetch(apiUrl("/api/runs"), {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeaders() },
         body: JSON.stringify({ query: query.trim() }),
       });
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail ?? "Run creation failed");
+        const detail = await readErrorMessage(res, "Run creation failed");
+        throw new Error(detail);
       }
       const data = await res.json();
       setSelectedRunId(data.run_id);
@@ -381,7 +401,7 @@ export default function App() {
 
     const initStream = async () => {
       try {
-        const ticketRes = await fetch(`/api/runs/${selectedRunId}/stream-ticket`, {
+        const ticketRes = await fetch(apiUrl(`/api/runs/${selectedRunId}/stream-ticket`), {
           method: "POST",
           headers: getAuthHeaders(),
         });
@@ -391,7 +411,9 @@ export default function App() {
         const ticketData = await ticketRes.json();
         if (cancelled) return;
         const ticketParam = encodeURIComponent(ticketData.ticket);
-        stream = new EventSource(`/api/runs/${selectedRunId}/events?ticket=${ticketParam}`);
+        stream = new EventSource(
+          apiUrl(`/api/runs/${selectedRunId}/events?ticket=${ticketParam}`)
+        );
         setIsStreaming(true);
 
         stream.addEventListener("run_update", (evt) => {
