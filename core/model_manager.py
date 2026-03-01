@@ -4,12 +4,14 @@ import asyncio
 import json
 import yaml
 import requests
+import logging
 from pathlib import Path
 from google import genai
 from google.genai.errors import ServerError
 from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).parent.parent
 MODELS_JSON = ROOT / "config" / "models.json"
@@ -82,36 +84,70 @@ class ModelManager:
 
     async def _gemini_generate(self, prompt: str) -> str:
         await self._wait_for_rate_limit()
+        timeout_sec = float((os.getenv("GEMINI_TIMEOUT_SEC") or "90").strip())
+        start = time.time()
+        model_name = self.model_info.get("model", "unknown")
+        logger.info("gemini_call_started model=%s mode=text timeout_sec=%.1f", model_name, timeout_sec)
         try:
             # ✅ CORRECT: Use truly async method
-            response = await self.client.aio.models.generate_content(
-                model=self.model_info["model"],
-                contents=prompt
+            response = await asyncio.wait_for(
+                self.client.aio.models.generate_content(
+                    model=self.model_info["model"],
+                    contents=prompt
+                ),
+                timeout=timeout_sec,
             )
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.info("gemini_call_succeeded model=%s mode=text elapsed_ms=%d", model_name, elapsed_ms)
             return response.text.strip()
 
+        except asyncio.TimeoutError:
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.error("gemini_call_timeout model=%s mode=text elapsed_ms=%d", model_name, elapsed_ms)
+            raise RuntimeError(f"Gemini text generation timed out after {int(timeout_sec)}s")
         except ServerError as e:
             # ✅ FIXED: Raise the exception instead of returning it
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.error("gemini_call_server_error model=%s mode=text elapsed_ms=%d error=%s", model_name, elapsed_ms, str(e))
             raise e
         except Exception as e:
             # ✅ Handle other potential errors
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.error("gemini_call_failed model=%s mode=text elapsed_ms=%d error=%s", model_name, elapsed_ms, str(e))
             raise RuntimeError(f"Gemini generation failed: {str(e)}")
 
     async def _gemini_generate_content(self, contents: list) -> str:
         """Generate content with support for text and images using Gemini"""
+        timeout_sec = float((os.getenv("GEMINI_TIMEOUT_SEC") or "90").strip())
+        start = time.time()
+        model_name = self.model_info.get("model", "unknown")
+        logger.info("gemini_call_started model=%s mode=content timeout_sec=%.1f", model_name, timeout_sec)
         try:
             # ✅ Use async method with contents array (text + images)
-            response = await self.client.aio.models.generate_content(
-                model=self.model_info["model"],
-                contents=contents
+            response = await asyncio.wait_for(
+                self.client.aio.models.generate_content(
+                    model=self.model_info["model"],
+                    contents=contents
+                ),
+                timeout=timeout_sec,
             )
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.info("gemini_call_succeeded model=%s mode=content elapsed_ms=%d", model_name, elapsed_ms)
             return response.text.strip()
 
+        except asyncio.TimeoutError:
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.error("gemini_call_timeout model=%s mode=content elapsed_ms=%d", model_name, elapsed_ms)
+            raise RuntimeError(f"Gemini content generation timed out after {int(timeout_sec)}s")
         except ServerError as e:
             # ✅ FIXED: Raise the exception instead of returning it
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.error("gemini_call_server_error model=%s mode=content elapsed_ms=%d error=%s", model_name, elapsed_ms, str(e))
             raise e
         except Exception as e:
             # ✅ Handle other potential errors
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.error("gemini_call_failed model=%s mode=content elapsed_ms=%d error=%s", model_name, elapsed_ms, str(e))
             raise RuntimeError(f"Gemini content generation failed: {str(e)}")
 
     async def _ollama_generate(self, prompt: str) -> str:

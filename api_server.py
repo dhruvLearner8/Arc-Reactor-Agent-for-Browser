@@ -432,7 +432,9 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
     )
 
     try:
+        print(f"[run:{run_id}] execution_bootstrap_started")
         await multi_mcp.start()
+        print(f"[run:{run_id}] multi_mcp_started")
         loop = AgentLoop4(multi_mcp=multi_mcp)
 
         run_task = asyncio.create_task(
@@ -473,7 +475,10 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
         if save_local_sessions:
             watcher_task = asyncio.create_task(_watch_session_file(run_id, stop_event))
 
-        context = await run_task
+        run_timeout_sec = int((os.getenv("RUN_TIMEOUT_SEC") or "900").strip())
+        print(f"[run:{run_id}] awaiting_agent_loop timeout_sec={run_timeout_sec}")
+        context = await asyncio.wait_for(run_task, timeout=run_timeout_sec)
+        print(f"[run:{run_id}] agent_loop_completed")
         context.plan_graph.graph["owner_user_id"] = owner_user_id
         if owner_email:
             context.plan_graph.graph["owner_email"] = owner_email
@@ -504,6 +509,23 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
             owner_user_id=owner_user_id,
             run_id=run_id,
             payload={"session_id": session_id, "status": "completed"},
+        )
+        run_record = _build_run_record(run_id)
+        if run_record:
+            await RUN_STORE.upsert_run(run_record)
+    except asyncio.TimeoutError:
+        RUNS[run_id]["status"] = "failed"
+        timeout_sec = int((os.getenv("RUN_TIMEOUT_SEC") or "900").strip())
+        err_msg = f"Run timed out after {timeout_sec}s"
+        RUNS[run_id]["error"] = err_msg
+        _publish_event(run_id, {"status": "failed", "error": err_msg}, event="run_error")
+        await RUN_STORE.insert_log(
+            level="ERROR",
+            event_type="run_failed",
+            message="Run execution timed out",
+            owner_user_id=owner_user_id,
+            run_id=run_id,
+            payload={"error": err_msg, "timeout_sec": timeout_sec},
         )
         run_record = _build_run_record(run_id)
         if run_record:
