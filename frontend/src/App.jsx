@@ -172,22 +172,54 @@ function renderNodeOutput(node) {
 
   const pickBestString = (obj) => {
     if (!obj || typeof obj !== "object") return "";
-    const priority = [
-      "final_answer",
-      "formatted_output",
-      "formatted_report",
-      "formatted_dollar_report_T008",
-      "summary",
-    ];
+    const keys = Object.keys(obj);
+    const metadataKeys = new Set([
+      "final_format",
+      "format",
+      "output_format",
+      "content_type",
+      "mime_type",
+      "language",
+    ]);
+    const contentEntries = Object.entries(obj).filter(
+      ([key, value]) => typeof value === "string" && !metadataKeys.has(key)
+    );
+    const pickLongestByKeys = (entries) =>
+      entries
+        .slice()
+        .sort((a, b) => (b[1]?.length ?? 0) - (a[1]?.length ?? 0))[0]?.[1] ?? "";
+
+    // 1) Prefer rich formatter reports (often dynamic keys like formatted_report_*).
+    const dynamicReportKey = keys.find(
+      (k) => k.toLowerCase().startsWith("formatted_report") && typeof obj[k] === "string"
+    );
+    if (dynamicReportKey) return normalizeString(obj[dynamicReportKey]);
+
+    // 2) Prefer richer final payloads (e.g. final_travel_dossier_T009) over short fallback summaries.
+    const finalContentEntries = contentEntries.filter(([key]) => {
+      const lower = key.toLowerCase();
+      return lower.startsWith("final_") && lower !== "final_format";
+    });
+    const longestFinalContent = pickLongestByKeys(finalContentEntries);
+    if (longestFinalContent) return normalizeString(longestFinalContent);
+
+    // 3) Then try known high-signal content fields.
+    const priority = ["formatted_report", "formatted_output", "final_answer", "fallback_markdown", "summary"];
     for (const key of priority) {
       if (typeof obj[key] === "string") return normalizeString(obj[key]);
     }
-    const dynamicFormatted = Object.keys(obj).find(
-      (k) => k.toLowerCase().includes("formatted") && typeof obj[k] === "string"
+
+    // 4) Generic formatted keys (but still content-only).
+    const dynamicFormatted = keys.find(
+      (k) =>
+        k.toLowerCase().includes("formatted") &&
+        typeof obj[k] === "string" &&
+        !metadataKeys.has(k)
     );
     if (dynamicFormatted) return normalizeString(obj[dynamicFormatted]);
 
-    const firstString = Object.values(obj).find((v) => typeof v === "string");
+    // 5) Final fallback: choose longest non-metadata text.
+    const firstString = pickLongestByKeys(contentEntries);
     return firstString ? normalizeString(firstString) : "";
   };
 
@@ -397,6 +429,8 @@ export default function App() {
 
   useEffect(() => {
     const isActiveRun =
+      !selectedRunMeta ||
+      selectedRunMeta?.status === "starting" ||
       selectedRunMeta?.status === "running" ||
       selectedRunMeta?.status === "queued" ||
       selectedRunMeta?.status === "pending";
@@ -457,6 +491,7 @@ export default function App() {
           }
           setIsStreaming(false);
           fetchRuns();
+          fetchRunDetail(selectedRunId);
           stream?.close();
         });
 
@@ -469,11 +504,13 @@ export default function App() {
           }
           setIsStreaming(false);
           fetchRuns();
+          fetchRunDetail(selectedRunId);
           stream?.close();
         });
 
         stream.onerror = () => {
           setIsStreaming(false);
+          fetchRunDetail(selectedRunId);
           stream?.close();
         };
       } catch (e) {
