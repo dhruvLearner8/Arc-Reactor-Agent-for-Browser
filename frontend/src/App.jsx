@@ -250,6 +250,10 @@ export default function App() {
     () => runDetail?.nodes?.find((n) => n.id === selectedNodeId),
     [runDetail, selectedNodeId]
   );
+  const selectedRunMeta = useMemo(
+    () => runs.find((r) => r.run_id === selectedRunId) ?? null,
+    [runs, selectedRunId]
+  );
 
   const flowData = useMemo(() => buildFlowData(runDetail, theme), [runDetail, theme]);
 
@@ -392,7 +396,11 @@ export default function App() {
   }, [selectedRunId, accessToken]);
 
   useEffect(() => {
-    if (!selectedRunId || !selectedRunId.startsWith("run_") || !accessToken) {
+    const isActiveRun =
+      selectedRunMeta?.status === "running" ||
+      selectedRunMeta?.status === "queued" ||
+      selectedRunMeta?.status === "pending";
+    if (!selectedRunId || !selectedRunId.startsWith("run_") || !accessToken || !isActiveRun) {
       setIsStreaming(false);
       return;
     }
@@ -405,6 +413,11 @@ export default function App() {
           method: "POST",
           headers: getAuthHeaders(),
         });
+        if (ticketRes.status === 404) {
+          // Historical/completed runs are not streamable; skip quietly.
+          setIsStreaming(false);
+          return;
+        }
         if (!ticketRes.ok) {
           throw new Error("Failed to open stream (ticket denied)");
         }
@@ -475,7 +488,7 @@ export default function App() {
       stream?.close();
       setIsStreaming(false);
     };
-  }, [selectedRunId, accessToken]);
+  }, [selectedRunId, accessToken, selectedRunMeta?.status]);
 
   return (
     <div className={`app-page theme-${theme}`}>
