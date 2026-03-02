@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: arc-reactor-backend
+    runtime: python
+    plan: starter
+    buildCommand: pip install --upgrade pip && pip install .
+    startCommand: uvicorn api_server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: LOCAL_RUN_STORE
+        value: "0"
+      - key: SAVE_LOCAL_SESSIONS
+        value: "0"

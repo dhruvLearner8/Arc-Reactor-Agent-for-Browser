@@ -26,6 +26,7 @@ https://youtu.be/wYQjWFYDFOg
 - [API Endpoints](#api-endpoints)
 - [Configuration](#configuration)
 - [Run Locally](#run-locally)
+- [Render + Supabase Setup](#render--supabase-setup)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
 
@@ -328,6 +329,14 @@ npm run dev
 ```
 
 Open `http://localhost:5173`.
+
+---
+
+## Render + Supabase Setup
+
+For a hybrid setup (local frontend + Render backend + Supabase persistence), follow:
+
+- `docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md`
 
 ---
 
