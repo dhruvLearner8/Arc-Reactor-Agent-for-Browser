@@ -40,9 +40,12 @@ class ExecutionContextManager:
             execution_time=0.0
         )
 
-        # Build plan DAG
-        for node in plan_graph.get("nodes", []):
-            self.plan_graph.add_node(node["id"], 
+        # Build plan DAG with robust normalization so planner shape drift
+        # does not crash the entire run.
+        normalized_nodes = self._normalize_nodes(plan_graph)
+        for node in normalized_nodes:
+            self.plan_graph.add_node(
+                node["id"],
                 **node,
                 status='pending',
                 output=None,
@@ -52,12 +55,150 @@ class ExecutionContextManager:
                 end_time=None,
                 execution_time=0.0
             )
-            
-        for edge in plan_graph.get("edges", []):
-            self.plan_graph.add_edge(edge["source"], edge["target"])
+
+        valid_node_ids = set(self.plan_graph.nodes)
+        normalized_edges = self._normalize_edges(plan_graph)
+        for source, target in normalized_edges:
+            if source not in valid_node_ids:
+                print(f"⚠️  Skipping edge with unknown source: {source} -> {target}")
+                continue
+            if target not in valid_node_ids:
+                print(f"⚠️  Skipping edge with unknown target: {source} -> {target}")
+                continue
+            self.plan_graph.add_edge(source, target)
+
+        # If planner returned no explicit edges, make DAG executable by
+        # connecting ROOT to all non-root nodes.
+        if self.plan_graph.number_of_nodes() > 1 and self.plan_graph.number_of_edges() == 0:
+            for node_id in self.plan_graph.nodes:
+                if node_id != "ROOT":
+                    self.plan_graph.add_edge("ROOT", node_id)
+
+        # Final safety fallback: if planner output is unusable, create one
+        # executable node so the run can continue instead of crashing.
+        if self.plan_graph.number_of_nodes() == 1:
+            fallback_prompt = original_query or "Analyze the request and provide the best possible answer."
+            self.plan_graph.add_node(
+                "T001",
+                id="T001",
+                description="Fallback single-step execution",
+                agent="ThinkerAgent",
+                agent_prompt=fallback_prompt,
+                reads=[],
+                writes=["final_answer_T001"],
+                status="pending",
+                output=None,
+                error=None,
+                cost=0.0,
+                start_time=None,
+                end_time=None,
+                execution_time=0.0
+            )
+            self.plan_graph.add_edge("ROOT", "T001")
+            print("⚠️  Planner output had no usable nodes; injected fallback node T001.")
 
         self.debug_mode = debug_mode
         self._live_display = None
+
+    @staticmethod
+    def _normalize_nodes(plan_graph):
+        nodes = []
+        raw_nodes = []
+        if isinstance(plan_graph, dict):
+            raw_nodes = (
+                plan_graph.get("nodes")
+                or plan_graph.get("tasks")
+                or []
+            )
+
+        if isinstance(raw_nodes, dict):
+            raw_nodes = list(raw_nodes.values())
+        if not isinstance(raw_nodes, list):
+            raw_nodes = []
+
+        for raw in raw_nodes:
+            if not isinstance(raw, dict):
+                continue
+            node_id = (
+                raw.get("id")
+                or raw.get("step_id")
+                or raw.get("node_id")
+                or raw.get("task_id")
+                or raw.get("name")
+            )
+            if not node_id:
+                print(f"⚠️  Skipping planner node without id: {raw}")
+                continue
+
+            node = dict(raw)
+            node["id"] = str(node_id)
+            node.setdefault("description", f"Task {node['id']}")
+            node.setdefault("agent", "ThinkerAgent")
+            node.setdefault("agent_prompt", node.get("description", ""))
+
+            reads = node.get("reads", [])
+            if not isinstance(reads, list):
+                reads = [reads] if reads else []
+            node["reads"] = [r for r in reads if isinstance(r, str)]
+
+            writes = node.get("writes", [])
+            if not isinstance(writes, list):
+                writes = [writes] if writes else []
+            node["writes"] = [w for w in writes if isinstance(w, str)]
+
+            nodes.append(node)
+        return nodes
+
+    @staticmethod
+    def _normalize_edges(plan_graph):
+        edges = []
+        raw_edges = []
+        if isinstance(plan_graph, dict):
+            raw_edges = (
+                plan_graph.get("edges")
+                or plan_graph.get("links")
+                or plan_graph.get("dependencies")
+                or []
+            )
+
+        if isinstance(raw_edges, dict):
+            raw_edges = list(raw_edges.values())
+        if not isinstance(raw_edges, list):
+            raw_edges = []
+
+        for raw in raw_edges:
+            source = None
+            target = None
+
+            if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                source, target = raw[0], raw[1]
+            elif isinstance(raw, str) and "->" in raw:
+                parts = [p.strip() for p in raw.split("->", 1)]
+                if len(parts) == 2:
+                    source, target = parts[0], parts[1]
+            elif isinstance(raw, dict):
+                source = (
+                    raw.get("source")
+                    or raw.get("from")
+                    or raw.get("src")
+                    or raw.get("parent")
+                    or raw.get("upstream")
+                    or raw.get("depends_on")
+                )
+                target = (
+                    raw.get("target")
+                    or raw.get("to")
+                    or raw.get("dst")
+                    or raw.get("child")
+                    or raw.get("downstream")
+                    or raw.get("node")
+                )
+
+            if source and target:
+                edges.append((str(source), str(target)))
+            else:
+                print(f"⚠️  Skipping malformed planner edge: {raw}")
+        return edges
 
     def get_ready_steps(self):
         """Return all steps whose dependencies are complete and not yet run."""
@@ -214,7 +355,8 @@ class ExecutionContextManager:
         return (
             agent_type == "ClarificationAgent" and 
             isinstance(output, dict) and
-            "clarificationMessage" in output
+            "clarificationMessage" in output and
+            not output.get("interaction_completed")
         )
 
     def _record_data_quality(self, key, value):

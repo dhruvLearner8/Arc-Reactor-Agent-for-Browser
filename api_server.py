@@ -30,6 +30,11 @@ class RunCreateRequest(BaseModel):
     query: str = Field(min_length=1, description="User query to execute")
 
 
+class ClarificationSubmitRequest(BaseModel):
+    response: str = Field(min_length=1, max_length=2000)
+    clarification_id: str | None = None
+
+
 class RunCreateResponse(BaseModel):
     run_id: str
     status: str
@@ -441,6 +446,9 @@ def _publish_event(run_id: str, payload: dict[str, Any], event: str = "message")
     if not run:
         return
     if payload.get("snapshot"):
+        if isinstance(payload["snapshot"], dict):
+            payload["snapshot"]["activity"] = run.get("activity", [])[:50]
+            payload["snapshot"]["pending_clarification"] = run.get("pending_clarification")
         run["snapshot"] = payload["snapshot"]
         _save_local_run_record(run_id)
     subscribers = run.get("subscribers", set())
@@ -502,7 +510,77 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
         print(f"[run:{run_id}] execution_bootstrap_started")
         await multi_mcp.start()
         print(f"[run:{run_id}] multi_mcp_started")
-        loop = AgentLoop4(multi_mcp=multi_mcp)
+        
+        async def on_agent_activity(event: dict[str, Any]) -> None:
+            run = RUNS.get(run_id)
+            if not run:
+                return
+            enriched = {"run_id": run_id, **event}
+            activity = run.setdefault("activity", [])
+            activity.insert(0, enriched)
+            del activity[200:]
+            _publish_event(run_id, {"activity": enriched}, event="run_activity")
+
+        async def on_clarification(step_id: str, output: dict[str, Any]) -> str:
+            run = RUNS.get(run_id)
+            if not run:
+                raise RuntimeError("Run not found while waiting for clarification")
+
+            clarification_id = f"cq_{uuid4().hex[:10]}"
+            pending = {
+                "id": clarification_id,
+                "step_id": step_id,
+                "agent": "ClarificationAgent",
+                "message": output.get("clarificationMessage", "Please provide additional input."),
+                "options": output.get("options", []),
+                "writes_to": output.get("writes_to", "user_response"),
+                "created_at": datetime.utcnow().isoformat(),
+            }
+            run["pending_clarification"] = pending
+            if isinstance(run.get("snapshot"), dict):
+                run["snapshot"]["pending_clarification"] = pending
+            _publish_event(run_id, {"clarification": pending, "snapshot": run.get("snapshot")}, event="run_clarification")
+
+            timeout_sec = int((os.getenv("CLARIFICATION_TIMEOUT_SEC") or "900").strip())
+            waited = 0.0
+            while waited < timeout_sec:
+                current = RUNS.get(run_id)
+                if not current:
+                    raise RuntimeError("Run disappeared while waiting for clarification")
+                active = current.get("pending_clarification")
+                if not active:
+                    raise RuntimeError("Clarification state lost before response")
+                response = active.get("response")
+                if isinstance(response, str) and response.strip():
+                    resolved = {**active, "resolved_at": datetime.utcnow().isoformat()}
+                    current["pending_clarification"] = None
+                    if isinstance(current.get("snapshot"), dict):
+                        current["snapshot"]["pending_clarification"] = None
+                    _publish_event(
+                        run_id,
+                        {"clarification": resolved, "snapshot": current.get("snapshot")},
+                        event="run_clarification_resolved",
+                    )
+                    return response.strip()
+                await asyncio.sleep(0.5)
+                waited += 0.5
+
+            if RUNS.get(run_id):
+                RUNS[run_id]["pending_clarification"] = None
+                if isinstance(RUNS[run_id].get("snapshot"), dict):
+                    RUNS[run_id]["snapshot"]["pending_clarification"] = None
+                _publish_event(
+                    run_id,
+                    {"error": "Timed out waiting for clarification response"},
+                    event="run_clarification_timeout",
+                )
+            raise RuntimeError("Timed out waiting for clarification response")
+
+        loop = AgentLoop4(
+            multi_mcp=multi_mcp,
+            event_callback=on_agent_activity,
+            clarification_callback=on_clarification,
+        )
 
         run_task = asyncio.create_task(
             loop.run(
@@ -527,6 +605,8 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 bootstrap_snapshot = _context_to_run_detail(loop.bootstrap_context, status="running")
                 bootstrap_snapshot["run_id"] = run_id
                 bootstrap_snapshot["session_id"] = session_id
+                bootstrap_snapshot["activity"] = RUNS[run_id].get("activity", [])[:50]
+                bootstrap_snapshot["pending_clarification"] = RUNS[run_id].get("pending_clarification")
                 _publish_event(run_id, {"snapshot": bootstrap_snapshot}, event="run_update")
                 run_record = _build_run_record(run_id)
                 if run_record and _use_supabase_store():
@@ -565,6 +645,8 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
         final_snapshot = _context_to_run_detail(context, status="completed")
         final_snapshot["run_id"] = run_id
         final_snapshot["session_id"] = session_id
+        final_snapshot["activity"] = RUNS[run_id].get("activity", [])[:50]
+        final_snapshot["pending_clarification"] = RUNS[run_id].get("pending_clarification")
         _publish_event(
             run_id,
             {"status": "completed", "summary": summary, "snapshot": final_snapshot},
@@ -705,7 +787,12 @@ async def get_run(run_id: str, current_user: AuthUser = Depends(get_current_user
     if run_id in RUNS and RUNS[run_id].get("snapshot"):
         if not _run_belongs_to_user(RUNS.get(run_id), current_user.user_id):
             raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
-        return RUNS[run_id]["snapshot"]
+        detail = RUNS[run_id]["snapshot"]
+        if isinstance(detail, dict):
+            detail = detail.copy()
+            detail["pending_clarification"] = RUNS[run_id].get("pending_clarification")
+            detail["activity"] = RUNS[run_id].get("activity", [])[:50]
+        return detail
 
     # Persisted history.
     if LOCAL_RUN_STORE:
@@ -731,6 +818,30 @@ async def create_stream_ticket(
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
     ticket = _issue_stream_ticket(run_id, current_user.user_id)
     return {"ticket": ticket, "expires_in": 120}
+
+
+@app.post("/api/runs/{run_id}/clarification")
+async def submit_clarification(
+    run_id: str,
+    request: ClarificationSubmitRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not active")
+    if not _run_belongs_to_user(run, current_user.user_id):
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+    pending = run.get("pending_clarification")
+    if not pending:
+        raise HTTPException(status_code=409, detail="No pending clarification for this run")
+    if request.clarification_id and pending.get("id") != request.clarification_id:
+        raise HTTPException(status_code=409, detail="Clarification request no longer active")
+    response = request.response.strip()
+    if not response:
+        raise HTTPException(status_code=400, detail="Clarification response cannot be empty")
+    pending["response"] = response
+    pending["responded_at"] = datetime.utcnow().isoformat()
+    return {"status": "accepted", "run_id": run_id, "clarification_id": pending.get("id")}
 
 
 @app.get("/api/runs/{run_id}/events")
@@ -811,11 +922,14 @@ async def create_run(
             ],
             "links": [],
             "globals_schema": {},
+            "activity": [],
         },
         "subscribers": set(),
         "session_id": None,
         "owner_user_id": current_user.user_id,
         "owner_email": current_user.email,
+        "activity": [],
+        "pending_clarification": None,
     }
     _save_local_run_record(run_id)
     if _use_supabase_store():
