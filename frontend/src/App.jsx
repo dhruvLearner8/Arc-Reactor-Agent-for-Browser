@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactFlow, {
   Background,
   Controls,
@@ -22,6 +22,10 @@ const statusColor = {
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/+$/, "");
 const apiUrl = (path) => (API_BASE_URL ? `${API_BASE_URL}${path}` : path);
+const SAMPLE_QUERIES = [
+  "Plan a USA road trip from Canada with 3 friends under CAD 3,000 per person, including route, stays, activities, and budget split.",
+  "What should I buy in 2026: gold or stocks? Do detailed research with macro trends, risks, scenarios, and a practical recommendation.",
+];
 
 function statusSubtitle(node) {
   const agent = (node.agent || "").toLowerCase();
@@ -34,7 +38,10 @@ function statusSubtitle(node) {
     if (agent.includes("formatter")) return "Formatting final report...";
     return "Running...";
   }
-  if (status === "completed") return "Completed";
+  if (status === "completed") {
+    if (agent.includes("formatter")) return "Final answer ready - click this node.";
+    return "Completed";
+  }
   if (status === "failed") return "Failed";
   return "Waiting on dependencies...";
 }
@@ -53,7 +60,7 @@ function AgentNode({ data }) {
 
 const nodeTypes = { agentNode: AgentNode };
 
-function buildFlowData(run, theme = "dark") {
+function buildFlowData(run, theme = "dark", blinkFormatter = false) {
   if (!run) return { nodes: [], edges: [] };
   const rawNodes = run.nodes ?? [];
   const rawEdges = run.links ?? [];
@@ -113,6 +120,7 @@ function buildFlowData(run, theme = "dark") {
         const x = 120 + (idx + offset) * xGap;
         const y = 80 + level * yGap;
         const status = node.status ?? "pending";
+        const isFormatter = (node.agent || "").toLowerCase().includes("formatter");
         nodes.push({
           id: node.id,
           type: "agentNode",
@@ -130,6 +138,12 @@ function buildFlowData(run, theme = "dark") {
             padding: 10,
             background: isLight ? "#ffffff" : "#0f172a",
             color: isLight ? "#0f172a" : "#f8fafc",
+            animation: blinkFormatter && isFormatter ? "formatter-blink 1s ease-in-out infinite" : undefined,
+            boxShadow:
+              blinkFormatter && isFormatter
+                ? "0 0 0 3px rgba(56,189,248,0.45)"
+                : undefined,
+            borderWidth: blinkFormatter && isFormatter ? 3 : 2,
           },
         });
       });
@@ -150,6 +164,104 @@ function buildFlowData(run, theme = "dark") {
   }));
 
   return { nodes, edges };
+}
+
+function estimateDepth(run) {
+  if (!run) return 1;
+  const nodes = Array.isArray(run.nodes) ? run.nodes : [];
+  const links = Array.isArray(run.links) ? run.links : [];
+  if (!nodes.length) return 1;
+  const levelById = new Map();
+  levelById.set("ROOT", 0);
+  const sorted = links.slice();
+  // Relax edges repeatedly for DAG-like graphs.
+  for (let i = 0; i < nodes.length; i += 1) {
+    let changed = false;
+    for (const edge of sorted) {
+      const src = edge?.source;
+      const dst = edge?.target;
+      if (!src || !dst) continue;
+      const srcLevel = levelById.get(src);
+      if (srcLevel == null) continue;
+      const next = srcLevel + 1;
+      if ((levelById.get(dst) ?? -1) < next) {
+        levelById.set(dst, next);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+  let maxLevel = 1;
+  for (const node of nodes) {
+    if (node?.id === "ROOT") continue;
+    maxLevel = Math.max(maxLevel, levelById.get(node?.id) ?? 1);
+  }
+  return maxLevel;
+}
+
+function formatEta(seconds) {
+  const safe = Math.max(0, Math.round(seconds || 0));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+  if (mins <= 0) return `~${secs}s`;
+  if (secs === 0) return `~${mins} min`;
+  return `~${mins}m ${secs}s`;
+}
+
+function estimateRemainingSeconds(run, nowMs = Date.now()) {
+  if (!run) return null;
+  const nodes = (run.nodes ?? []).filter((n) => n.id !== "ROOT");
+  if (!nodes.length) return null;
+  const byAgentBase = (agentName = "") => {
+    const agent = agentName.toLowerCase();
+    if (agent.includes("planner")) return 24;
+    if (agent.includes("retriever")) return 72;
+    if (agent.includes("thinker")) return 45;
+    if (agent.includes("distiller")) return 32;
+    if (agent.includes("formatter")) return 24;
+    if (agent.includes("summarizer")) return 20;
+    if (agent.includes("clarification")) return 65;
+    return 35;
+  };
+
+  const queryWords = String(run.query || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  const depth = estimateDepth(run);
+  const sizeFactor = Math.max(0, nodes.length - 4) * 0.035;
+  const queryFactor = Math.min(0.2, queryWords / 200);
+  const depthFactor = Math.max(0, depth - 3) * 0.05;
+  const complexityMultiplier = 1 + Math.min(0.55, sizeFactor + queryFactor + depthFactor);
+
+  let completedActual = 0;
+  let completedBaseline = 0;
+  for (const node of nodes) {
+    if (node.status !== "completed" || !Number.isFinite(Number(node.execution_time))) continue;
+    const actual = Number(node.execution_time);
+    if (actual <= 0) continue;
+    completedActual += actual;
+    completedBaseline += byAgentBase(node.agent) * complexityMultiplier;
+  }
+  const runtimeMultiplier =
+    completedBaseline > 0
+      ? Math.max(0.65, Math.min(1.9, completedActual / completedBaseline))
+      : 1;
+
+  let remaining = 0;
+  for (const node of nodes) {
+    const baseline = byAgentBase(node.agent) * complexityMultiplier * runtimeMultiplier;
+    if (node.status === "completed" || node.status === "failed") continue;
+    if (node.status === "running") {
+      const startMs = Date.parse(String(node.start_time || ""));
+      const elapsed = Number.isFinite(startMs) ? Math.max(0, (nowMs - startMs) / 1000) : 0;
+      const expected = Math.max(baseline, elapsed * 1.25);
+      remaining += Math.max(6, expected - elapsed);
+      continue;
+    }
+    remaining += baseline;
+  }
+  return Math.max(5, remaining);
 }
 
 function renderNodeOutput(node) {
@@ -217,12 +329,94 @@ function renderNodeOutput(node) {
     return normalized;
   };
 
+  const truncate = (value, max = 240) => {
+    if (typeof value !== "string") return value;
+    if (value.length <= max) return value;
+    return `${value.slice(0, max)}...`;
+  };
+
+  const prettyValue = (value) => {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "string") return truncate(normalizeString(value));
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    return "";
+  };
+
+  const objectToMarkdown = (obj) => {
+    if (!obj || typeof obj !== "object") return "";
+    const lines = [];
+    const pushKV = (label, value) => {
+      const text = prettyValue(value);
+      if (text) lines.push(`- **${label}:** ${text}`);
+    };
+
+    // High-signal fields first.
+    pushKV("Thought", obj.thought);
+    pushKV("Reason", obj.reason);
+    pushKV("Summary", obj.summary);
+    pushKV("Next instruction", obj.next_instruction);
+    pushKV("Execution status", obj.execution_status);
+    pushKV("Execution error", obj.execution_error);
+    pushKV("Executed variant", obj.executed_variant);
+    pushKV("Clarification", obj.clarificationMessage);
+
+    const tool = obj.call_tool;
+    if (tool && typeof tool === "object") {
+      const toolName = tool.name || "unknown_tool";
+      lines.push(`- **Tool call:** \`${toolName}\``);
+      if (tool.arguments && typeof tool.arguments === "object") {
+        const argPreview = truncate(JSON.stringify(tool.arguments), 300);
+        lines.push(`- **Tool args:** \`${argPreview}\``);
+      }
+    }
+
+    // Add compact rendering for remaining primitive fields.
+    const used = new Set([
+      "thought",
+      "reason",
+      "summary",
+      "next_instruction",
+      "execution_status",
+      "execution_error",
+      "executed_variant",
+      "clarificationMessage",
+      "call_tool",
+      "cost",
+      "input_tokens",
+      "output_tokens",
+      "total_tokens",
+      "call_self",
+      "code_variants",
+      "output",
+    ]);
+    Object.entries(obj).forEach(([key, value]) => {
+      if (used.has(key)) return;
+      if (Array.isArray(value)) {
+        if (!value.length) return;
+        const previewItems = value
+          .slice(0, 3)
+          .map((v) => prettyValue(v) || truncate(JSON.stringify(v), 80))
+          .join(" | ");
+        lines.push(`- **${key}:** ${previewItems}${value.length > 3 ? " | ..." : ""}`);
+        return;
+      }
+      if (value && typeof value === "object") return;
+      const text = prettyValue(value);
+      if (text) lines.push(`- **${key}:** ${text}`);
+    });
+
+    if (!lines.length) {
+      return `\`\`\`json\n${JSON.stringify(obj, null, 2)}\n\`\`\``;
+    }
+    return `### Agent Output\n\n${lines.join("\n")}`;
+  };
+
   const output = node.output;
   if (typeof output === "string") return normalizeString(output);
   if (!output) return "No output captured for this node.";
   const best = pickBestString(output);
   if (best) return normalizeMarkdownTables(htmlToMarkdownIfNeeded(best));
-  return `\`\`\`json\n${JSON.stringify(output, null, 2)}\n\`\`\``;
+  return objectToMarkdown(output);
 }
 
 export default function App() {
@@ -244,6 +438,14 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [viewMode, setViewMode] = useState("rendered");
   const [inspectorExpanded, setInspectorExpanded] = useState(false);
+  const [sampleQueriesOpen, setSampleQueriesOpen] = useState(false);
+  const [clarificationCollapsed, setClarificationCollapsed] = useState(true);
+  const [clarificationResponse, setClarificationResponse] = useState("");
+  const [clarificationSubmitting, setClarificationSubmitting] = useState(false);
+  const [clarificationPanelHeight, setClarificationPanelHeight] = useState(340);
+  const [etaNowMs, setEtaNowMs] = useState(Date.now());
+  const autoFocusedFormatterRunRef = useRef(new Set());
+  const clarificationPanelRef = useRef(null);
   const accessToken = session?.access_token ?? "";
 
   const selectedNode = useMemo(
@@ -255,7 +457,53 @@ export default function App() {
     [runs, selectedRunId]
   );
 
-  const flowData = useMemo(() => buildFlowData(runDetail, theme), [runDetail, theme]);
+  const shouldBlinkFormatter = useMemo(
+    () => runDetail?.status === "completed",
+    [runDetail]
+  );
+  const flowData = useMemo(
+    () => buildFlowData(runDetail, theme, shouldBlinkFormatter),
+    [runDetail, theme, shouldBlinkFormatter]
+  );
+  const pendingClarification = useMemo(
+    () => runDetail?.pending_clarification ?? null,
+    [runDetail]
+  );
+  const failedNode = useMemo(
+    () => (runDetail?.nodes ?? []).find((n) => n.id !== "ROOT" && n.status === "failed"),
+    [runDetail]
+  );
+  const executionStatus = useMemo(() => {
+    if (!runDetail) return { kind: "idle", text: "Waiting for run." };
+    if (runDetail.status === "failed" || failedNode) {
+      return {
+        kind: "error",
+        text: "Error occurred while execution, please do a new search.",
+      };
+    }
+    if (runDetail.status === "completed") {
+      return { kind: "completed", text: "Completed" };
+    }
+    return { kind: "working", text: "Working..." };
+  }, [runDetail, failedNode]);
+  const executionErrorText = useMemo(() => {
+    if (failedNode?.error) return String(failedNode.error);
+    if (runDetail?.error) return String(runDetail.error);
+    return "";
+  }, [failedNode, runDetail]);
+  const showResearchHint = useMemo(() => {
+    const status = (runDetail?.status || "").toLowerCase();
+    return ["starting", "queued", "pending", "running"].includes(status);
+  }, [runDetail]);
+  const researchEta = useMemo(
+    () => (showResearchHint ? estimateRemainingSeconds(runDetail, etaNowMs) : null),
+    [runDetail, etaNowMs, showResearchHint]
+  );
+  const researchEtaLabel = useMemo(
+    () => (researchEta ? `Estimated time: ${formatEta(researchEta)}` : "Estimated time: calculating..."),
+    [researchEta]
+  );
+  const statusPanelTop = 46 + clarificationPanelHeight + 12;
 
   const getAuthHeaders = () =>
     accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
@@ -323,7 +571,11 @@ export default function App() {
       const data = await res.json();
       setRunDetail(data);
       const firstNode = (data.nodes ?? []).find((n) => n.id !== "ROOT");
-      setSelectedNodeId(firstNode?.id ?? "ROOT");
+      const availableIds = new Set((data.nodes ?? []).map((n) => n.id));
+      setSelectedNodeId((prev) => {
+        if (prev && availableIds.has(prev)) return prev;
+        return firstNode?.id ?? "ROOT";
+      });
     } catch (e) {
       setError(String(e));
     }
@@ -355,6 +607,33 @@ export default function App() {
       setError(String(e));
     } finally {
       setCreatingRun(false);
+    }
+  }
+
+  async function submitClarification() {
+    if (!pendingClarification || !selectedRunId || !accessToken) return;
+    const response = clarificationResponse.trim();
+    if (!response) return;
+    setClarificationSubmitting(true);
+    setError("");
+    try {
+      const res = await fetch(apiUrl(`/api/runs/${selectedRunId}/clarification`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({
+          clarification_id: pendingClarification.id,
+          response,
+        }),
+      });
+      if (!res.ok) {
+        const detail = await readErrorMessage(res, "Failed to submit clarification response");
+        throw new Error(detail);
+      }
+      setClarificationResponse("");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setClarificationSubmitting(false);
     }
   }
 
@@ -394,6 +673,53 @@ export default function App() {
   useEffect(() => {
     if (selectedRunId && accessToken) fetchRunDetail(selectedRunId);
   }, [selectedRunId, accessToken]);
+
+  useEffect(() => {
+    setClarificationResponse("");
+  }, [selectedRunId, pendingClarification?.id]);
+
+  useEffect(() => {
+    if (!runDetail || runDetail.status !== "completed" || !runDetail.run_id) return;
+    if (autoFocusedFormatterRunRef.current.has(runDetail.run_id)) return;
+    const formatterNode = (runDetail.nodes ?? []).find((n) =>
+      (n.agent || "").toLowerCase().includes("formatter")
+    );
+    const hasFormatterOutput =
+      formatterNode &&
+      formatterNode.output != null &&
+      (typeof formatterNode.output !== "object" ||
+        (formatterNode.output && Object.keys(formatterNode.output).length > 0));
+    if (formatterNode?.id && hasFormatterOutput) {
+      setSelectedNodeId(formatterNode.id);
+      setViewMode("rendered");
+      setInspectorExpanded(true);
+      autoFocusedFormatterRunRef.current.add(runDetail.run_id);
+    }
+  }, [runDetail]);
+
+  useEffect(() => {
+    const panel = clarificationPanelRef.current;
+    if (!panel) return;
+
+    const updateHeight = () => {
+      const measured = Math.ceil(panel.getBoundingClientRect().height);
+      if (Number.isFinite(measured) && measured > 0) {
+        setClarificationPanelHeight(measured);
+      }
+    };
+
+    updateHeight();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [clarificationCollapsed, pendingClarification, clarificationResponse, clarificationSubmitting]);
+
+  useEffect(() => {
+    if (!showResearchHint) return;
+    const timer = window.setInterval(() => setEtaNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [showResearchHint]);
 
   useEffect(() => {
     const isActiveRun =
@@ -442,6 +768,38 @@ export default function App() {
                 const activeNode = payload.snapshot.nodes?.find((n) => n.status === "running");
                 if (activeNode) setSelectedNodeId(activeNode.id);
               }
+            }
+          } catch {
+            // no-op
+          }
+        });
+
+        stream.addEventListener("run_clarification", (evt) => {
+          try {
+            const payload = JSON.parse(evt.data);
+            if (payload?.snapshot) {
+              setRunDetail(payload.snapshot);
+            } else if (payload?.clarification) {
+              setRunDetail((prev) => {
+                if (!prev) return prev;
+                return { ...prev, pending_clarification: payload.clarification };
+              });
+            }
+          } catch {
+            // no-op
+          }
+        });
+
+        stream.addEventListener("run_clarification_resolved", (evt) => {
+          try {
+            const payload = JSON.parse(evt.data);
+            if (payload?.snapshot) {
+              setRunDetail(payload.snapshot);
+            } else {
+              setRunDetail((prev) => {
+                if (!prev) return prev;
+                return { ...prev, pending_clarification: null };
+              });
             }
           } catch {
             // no-op
@@ -506,7 +864,45 @@ export default function App() {
 
       <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""}`}>
         <aside className="left-panel">
-        <h2>Runs</h2>
+        <div className="left-panel-header">
+          <h2>Runs</h2>
+          <button
+            className="sample-toggle-btn"
+            onClick={() => setSampleQueriesOpen((v) => !v)}
+            type="button"
+            aria-expanded={sampleQueriesOpen}
+          >
+            <span className="sample-toggle-icon">?</span>
+            <span>Sample Queries</span>
+          </button>
+        </div>
+        {sampleQueriesOpen ? (
+          <div className="sample-queries-popover">
+            <div className="sample-queries-popover-header">
+              <div className="sample-queries-title">Try one of these</div>
+              <button
+                className="sample-close-btn"
+                onClick={() => setSampleQueriesOpen(false)}
+                type="button"
+              >
+                Close
+              </button>
+            </div>
+            {SAMPLE_QUERIES.map((sample) => (
+              <button
+                key={sample}
+                className="sample-query-btn"
+                onClick={() => {
+                  setQuery(sample);
+                  setSampleQueriesOpen(false);
+                }}
+                type="button"
+              >
+                {sample}
+              </button>
+            ))}
+          </div>
+        ) : null}
         <div className="new-run-box">
           <textarea
             rows={4}
@@ -541,6 +937,84 @@ export default function App() {
         <main className="graph-panel">
           <div className="panel-title">Execution Graph</div>
           {isStreaming ? <div className="live-pill">Live</div> : null}
+          {showResearchHint ? (
+            <div className="research-hint-panel">
+              <div className="research-hint-title">Agent doing research</div>
+              <div className="research-hint-subtitle">{researchEtaLabel}</div>
+            </div>
+          ) : null}
+          <div
+            ref={clarificationPanelRef}
+            className={`clarification-panel ${clarificationCollapsed ? "collapsed" : ""} ${
+              pendingClarification ? "attention" : ""
+            }`}
+          >
+            <div className="clarification-title">
+              <span>Agent Clarification</span>
+              <button
+                className={`clarification-toggle-btn ${pendingClarification ? "attention" : ""}`}
+                onClick={() => setClarificationCollapsed((v) => !v)}
+              >
+                {clarificationCollapsed ? "Expand" : "Collapse"}
+              </button>
+            </div>
+            {!clarificationCollapsed ? (
+              <>
+                <div className="clarification-body">
+                  {pendingClarification ? (
+                    <>
+                      <div className="clarification-scroll">
+                        <div className="clarification-message">
+                          {pendingClarification.message || pendingClarification.clarificationMessage}
+                        </div>
+                        {Array.isArray(pendingClarification.options) && pendingClarification.options.length ? (
+                          <div className="clarification-options">
+                            {pendingClarification.options.map((opt, idx) => (
+                              <button
+                                key={`${idx}-${opt}`}
+                                onClick={() => setClarificationResponse(String(opt))}
+                                disabled={clarificationSubmitting}
+                              >
+                                {String(opt)}
+                              </button>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                      <div className="clarification-actions">
+                        <textarea
+                          rows={3}
+                          value={clarificationResponse}
+                          onChange={(e) => setClarificationResponse(e.target.value)}
+                          placeholder="Type your response for the agent..."
+                        />
+                        <button
+                          onClick={submitClarification}
+                          disabled={clarificationSubmitting || !clarificationResponse.trim()}
+                        >
+                          {clarificationSubmitting ? "Submitting..." : "Submit Response"}
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="clarification-idle">
+                      No question right now. If the ClarificationAgent needs input, it will appear here.
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : null}
+          </div>
+          <div
+            className={`execution-status-panel status-${executionStatus.kind}`}
+            style={{ top: `${statusPanelTop}px` }}
+          >
+            <div className="execution-status-title">Execution Status</div>
+            <div className="execution-status-text">{executionStatus.text}</div>
+            {executionStatus.kind === "error" && executionErrorText ? (
+              <div className="execution-status-error">{executionErrorText}</div>
+            ) : null}
+          </div>
           <ReactFlow
             nodes={flowData.nodes}
             edges={flowData.edges}

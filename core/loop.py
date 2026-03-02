@@ -12,11 +12,32 @@ from rich.console import Console
 from datetime import datetime
 
 class AgentLoop4:
-    def __init__(self, multi_mcp, strategy="conservative"):
+    def __init__(self, multi_mcp, strategy="conservative", event_callback=None, clarification_callback=None):
         self.multi_mcp = multi_mcp
         self.strategy = strategy
         self.agent_runner = AgentRunner(multi_mcp)
         self.bootstrap_context = None
+        self.event_callback = event_callback
+        self.clarification_callback = clarification_callback
+
+    async def _emit_activity(self, message, *, level="info", agent=None, step_id=None, payload=None):
+        if not self.event_callback:
+            return
+        event = {
+            "level": level,
+            "message": message,
+            "agent": agent,
+            "step_id": step_id,
+            "payload": payload or {},
+            "at": datetime.utcnow().isoformat(),
+        }
+        try:
+            result = self.event_callback(event)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            # Activity streaming should never block execution.
+            pass
 
     def _create_bootstrap_context(self, query, file_manifest, globals_schema):
         """
@@ -55,6 +76,11 @@ class AgentLoop4:
         self.bootstrap_context = self._create_bootstrap_context(query, file_manifest, globals_schema)
         bootstrap_session_id = self.bootstrap_context.plan_graph.graph.get("session_id")
         log_step("Phase 1: Planning query and building execution graph...", symbol="🧭")
+        await self._emit_activity(
+            "PlannerAgent is creating the execution graph.",
+            agent="PlannerAgent",
+            step_id="BOOTSTRAP_PLANNING"
+        )
 
         # Phase 1: File Profiling (if files exist)
         file_profiles = {}
@@ -86,10 +112,23 @@ class AgentLoop4:
         if not plan_result["success"]:
             if self.bootstrap_context:
                 self.bootstrap_context.mark_failed("BOOTSTRAP_PLANNING", plan_result["error"])
+            await self._emit_activity(
+                f"PlannerAgent failed: {plan_result['error']}",
+                level="error",
+                agent="PlannerAgent",
+                step_id="BOOTSTRAP_PLANNING"
+            )
             raise RuntimeError(f"Planning failed: {plan_result['error']}")
 
         # Check if plan_graph exists
         if 'plan_graph' not in plan_result['output']:
+            await self._emit_activity(
+                "PlannerAgent returned invalid output (missing plan_graph).",
+                level="error",
+                agent="PlannerAgent",
+                step_id="BOOTSTRAP_PLANNING",
+                payload={"output_keys": list(plan_result.get("output", {}).keys())}
+            )
             raise RuntimeError(f"PlannerAgent output missing 'plan_graph' key. Got: {list(plan_result['output'].keys())}")
         
         plan_graph = plan_result["output"]["plan_graph"]
@@ -110,6 +149,11 @@ class AgentLoop4:
             context.set_file_profiles(file_profiles)
             context.plan_graph.graph['globals_schema'].update(globals_schema)
             log_step("Phase 1 completed. Starting DAG execution...", symbol="🧭")
+            await self._emit_activity(
+                "PlannerAgent finished. Executing DAG nodes.",
+                agent="PlannerAgent",
+                step_id="BOOTSTRAP_PLANNING"
+            )
 
             # Phase 4: Execute DAG with visualization
             await self._execute_dag(context)
@@ -122,6 +166,12 @@ class AgentLoop4:
             print(f"❌ ERROR creating ExecutionContextManager: {e}")
             import traceback
             traceback.print_exc()
+            await self._emit_activity(
+                f"Execution graph setup failed: {e}",
+                level="error",
+                agent="PlannerAgent",
+                step_id="BOOTSTRAP_PLANNING"
+            )
             raise
 
     async def _execute_dag(self, context):
@@ -179,6 +229,11 @@ class AgentLoop4:
                 step_data = context.get_step_data(step_id)
                 desc = step_data.get("agent_prompt", step_data.get("description", "No description"))[:60]
                 log_step(f"🔄 Starting {step_id} ({step_data['agent']}): {desc}...", symbol="🚀")
+                await self._emit_activity(
+                    f"{step_data['agent']} started: {step_data.get('description', step_id)}",
+                    agent=step_data.get("agent"),
+                    step_id=step_id
+                )
                 
                 visualizer.mark_running(step_id)
                 context.mark_running(step_id)
@@ -193,14 +248,31 @@ class AgentLoop4:
                     visualizer.mark_failed(step_id, result)
                     context.mark_failed(step_id, str(result))
                     log_error(f"❌ Failed {step_id}: {str(result)}")
+                    await self._emit_activity(
+                        f"{step_data['agent']} failed: {str(result)}",
+                        level="error",
+                        agent=step_data.get("agent"),
+                        step_id=step_id
+                    )
                 elif result["success"]:
                     visualizer.mark_completed(step_id)
                     await context.mark_done(step_id, result["output"])
                     log_step(f"✅ Completed {step_id} ({step_data['agent']})", symbol="✅")
+                    await self._emit_activity(
+                        f"{step_data['agent']} completed.",
+                        agent=step_data.get("agent"),
+                        step_id=step_id
+                    )
                 else:
                     visualizer.mark_failed(step_id, result["error"])
                     context.mark_failed(step_id, result["error"])
                     log_error(f"❌ Failed {step_id}: {result['error']}")
+                    await self._emit_activity(
+                        f"{step_data['agent']} failed: {result['error']}",
+                        level="error",
+                        agent=step_data.get("agent"),
+                        step_id=step_id
+                    )
 
         # Final state
         console.print(visualizer.get_layout())
@@ -275,6 +347,12 @@ class AgentLoop4:
                 tool_args = tool_call.get("arguments", {})
                 
                 log_step(f"🛠️ Executing Tool: {tool_name}", payload=tool_args, symbol="⚙️")
+                await self._emit_activity(
+                    f"{agent_type} is calling tool `{tool_name}`.",
+                    agent=agent_type,
+                    step_id=step_id,
+                    payload={"tool": tool_name}
+                )
                 
                 try:
                     # Execute tool via MultiMCP
@@ -288,6 +366,11 @@ class AgentLoop4:
 
                     # Log result (truncated)
                     log_step(f"✅ Tool Result", payload={"result_preview": result_str[:200] + "..."}, symbol="🔌")
+                    await self._emit_activity(
+                        f"{agent_type} received tool result from `{tool_name}`.",
+                        agent=agent_type,
+                        step_id=step_id
+                    )
                     
                     # Prepare input for next iteration
                     instruction = output.get("thought", "Use the tool result to generate the final output.")
@@ -303,6 +386,12 @@ class AgentLoop4:
 
                 except Exception as e:
                     log_error(f"Tool Execution Failed: {e}")
+                    await self._emit_activity(
+                        f"{agent_type} tool `{tool_name}` failed: {e}",
+                        level="error",
+                        agent=agent_type,
+                        step_id=step_id
+                    )
                     # Feed error back to agent
                     current_input = build_agent_input(
                         instruction="The tool execution failed. Try a different approach or tool.",
@@ -347,6 +436,37 @@ class AgentLoop4:
 
             # 3. Success (No tool call, just output)
             else:
+                if (
+                    agent_type == "ClarificationAgent"
+                    and isinstance(output, dict)
+                    and "clarificationMessage" in output
+                    and self.clarification_callback
+                ):
+                    await self._emit_activity(
+                        "ClarificationAgent is waiting for user input.",
+                        agent=agent_type,
+                        step_id=step_id
+                    )
+                    try:
+                        user_response = await self.clarification_callback(step_id, output)
+                    except Exception as e:
+                        return {"success": False, "error": f"Clarification response failed: {e}"}
+
+                    writes_to = output.get("writes_to", "user_response")
+                    question_text = output.get("clarificationMessage", "").strip()
+                    rich_context = f"Agent asked: {question_text} User said: {user_response}"
+                    output = output.copy()
+                    output["user_response"] = user_response
+                    output["rich_context"] = rich_context
+                    output["interaction_completed"] = True
+                    output[writes_to] = rich_context
+                    result["output"] = output
+                    await self._emit_activity(
+                        "Clarification response received. Resuming execution.",
+                        agent=agent_type,
+                        step_id=step_id
+                    )
+
                 # Retriever hardening: if only URLs were gathered without extracting
                 # requested facts, force one additional extraction pass.
                 if (
