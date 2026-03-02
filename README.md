@@ -31,6 +31,7 @@ https://youtu.be/wYQjWFYDFOg
 - [Configuration](#configuration)
 - [Run Locally](#run-locally)
 - [Project Structure](#project-structure)
+- [Report a Bug / Request a Feature](#report-a-bug--request-a-feature)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -352,6 +353,24 @@ S8 Share/
 ├── auth.py                 # JWT auth for API
 └── app.py                  # CLI/dev entry path
 ```
+
+---
+
+## Report a Bug / Request a Feature
+
+If you find an issue in production or while testing, please open a GitHub issue:
+
+- Bug report: `https://github.com/dhruvLearner8/Arc-Reactor-Agent-for-Browser/issues/new?template=bug_report.yml`
+- Feature request: `https://github.com/dhruvLearner8/Arc-Reactor-Agent-for-Browser/issues/new?template=feature_request.yml`
+- All issues: `https://github.com/dhruvLearner8/Arc-Reactor-Agent-for-Browser/issues`
+
+For faster triage, include:
+
+- exact query used
+- expected vs actual behavior
+- reproduction steps
+- browser/devices details
+- screenshots or logs (when available)
 
 ---
 
