@@ -27,6 +27,7 @@ pip-delete-this-directory.txt
 *.tar
 *.gz
 !assets/arc-reactor-hero.png
+!frontend/public/favicon.svg
 
 # Mac
 .DS_Store
