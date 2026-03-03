@@ -10,6 +10,11 @@ It combines a FastAPI backend, a React/ReactFlow frontend, MCP tool servers, and
 This README documents the **current architecture** , with emphasis on how planning, execution, streaming, and storage work together.
 
 ---
+# Live
+
+https://www.arc-reactor.app
+
+---
 # Demo - 1
 
 https://drive.google.com/file/d/1vt172Q0vzhBNi5NEmVYDxuZcMlvBef92/view?usp=sharing
