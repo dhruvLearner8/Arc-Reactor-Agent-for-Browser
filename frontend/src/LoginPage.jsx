@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { supabase } from "./lib/supabase";
 
 export default function LoginPage() {
@@ -13,7 +13,7 @@ export default function LoginPage() {
       .getSession()
       .then(({ data }) => {
         if (!mounted) return;
-        if (data.session) navigate("/", { replace: true });
+        if (data.session) navigate("/agent", { replace: true });
       })
       .finally(() => {
         if (mounted) setLoading(false);
@@ -22,7 +22,7 @@ export default function LoginPage() {
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (session) navigate("/", { replace: true });
+      if (session) navigate("/agent", { replace: true });
     });
 
     return () => {
@@ -35,16 +35,24 @@ export default function LoginPage() {
     setError("");
     const { error: signInError } = await supabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo: `${window.location.origin}/` },
+      options: { redirectTo: `${window.location.origin}/agent` },
     });
     if (signInError) setError(signInError.message);
   }
 
   return (
     <div className="login-page">
+      <header className="login-nav">
+        <div className="login-nav-left">
+          <span className="login-nav-brand">Arc Reactor</span>
+          <Link className="login-nav-home-link" to="/">
+            Homepage
+          </Link>
+        </div>
+      </header>
       <div className="login-card">
-        <h1>Agentic AI</h1>
-        <p>Sign in to access your runs and execution graph.</p>
+        <h1>Arc Reactor</h1>
+        <p>Sign in to start using the research agent.</p>
         <button onClick={signInWithGoogle} disabled={loading}>
           {loading ? "Checking session..." : "Sign in with Google"}
         </button>
