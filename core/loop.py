@@ -12,13 +12,21 @@ from rich.console import Console
 from datetime import datetime
 
 class AgentLoop4:
-    def __init__(self, multi_mcp, strategy="conservative", event_callback=None, clarification_callback=None):
+    def __init__(
+        self,
+        multi_mcp,
+        strategy="conservative",
+        event_callback=None,
+        clarification_callback=None,
+        progress_callback=None,
+    ):
         self.multi_mcp = multi_mcp
         self.strategy = strategy
         self.agent_runner = AgentRunner(multi_mcp)
         self.bootstrap_context = None
         self.event_callback = event_callback
         self.clarification_callback = clarification_callback
+        self.progress_callback = progress_callback
 
     async def _emit_activity(self, message, *, level="info", agent=None, step_id=None, payload=None):
         if not self.event_callback:
@@ -37,6 +45,23 @@ class AgentLoop4:
                 await result
         except Exception:
             # Activity streaming should never block execution.
+            pass
+
+    async def _emit_progress(self, context, *, stage="update", step_id=None):
+        if not self.progress_callback:
+            return
+        event = {
+            "stage": stage,
+            "step_id": step_id,
+            "session_id": context.plan_graph.graph.get("session_id"),
+            "at": datetime.utcnow().isoformat(),
+        }
+        try:
+            result = self.progress_callback(context, event)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            # Progress streaming should never block execution.
             pass
 
     def _create_bootstrap_context(self, query, file_manifest, globals_schema):
@@ -148,6 +173,7 @@ class AgentLoop4:
             # Initialize graph with file profiles and globals
             context.set_file_profiles(file_profiles)
             context.plan_graph.graph['globals_schema'].update(globals_schema)
+            await self._emit_progress(context, stage="dag_initialized")
             log_step("Phase 1 completed. Starting DAG execution...", symbol="🧭")
             await self._emit_activity(
                 "PlannerAgent finished. Executing DAG nodes.",
@@ -221,6 +247,7 @@ class AgentLoop4:
             for step_id in ready_steps:
                 visualizer.mark_running(step_id)
                 context.mark_running(step_id)
+                await self._emit_progress(context, stage="node_running", step_id=step_id)
             
             # ✅ EXECUTE AGENTS FOR REAL
             tasks = []
@@ -247,6 +274,7 @@ class AgentLoop4:
                 if isinstance(result, Exception):
                     visualizer.mark_failed(step_id, result)
                     context.mark_failed(step_id, str(result))
+                    await self._emit_progress(context, stage="node_failed", step_id=step_id)
                     log_error(f"❌ Failed {step_id}: {str(result)}")
                     await self._emit_activity(
                         f"{step_data['agent']} failed: {str(result)}",
@@ -257,6 +285,7 @@ class AgentLoop4:
                 elif result["success"]:
                     visualizer.mark_completed(step_id)
                     await context.mark_done(step_id, result["output"])
+                    await self._emit_progress(context, stage="node_completed", step_id=step_id)
                     log_step(f"✅ Completed {step_id} ({step_data['agent']})", symbol="✅")
                     await self._emit_activity(
                         f"{step_data['agent']} completed.",
@@ -266,6 +295,7 @@ class AgentLoop4:
                 else:
                     visualizer.mark_failed(step_id, result["error"])
                     context.mark_failed(step_id, result["error"])
+                    await self._emit_progress(context, stage="node_failed", step_id=step_id)
                     log_error(f"❌ Failed {step_id}: {result['error']}")
                     await self._emit_activity(
                         f"{step_data['agent']} failed: {result['error']}",

@@ -521,6 +521,25 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
             del activity[200:]
             _publish_event(run_id, {"activity": enriched}, event="run_activity")
 
+        async def on_context_progress(context, _event: dict[str, Any]) -> None:
+            run = RUNS.get(run_id)
+            if not run:
+                return
+            snapshot = _context_to_run_detail(context, status=run.get("status", "running"))
+            snapshot["run_id"] = run_id
+            snapshot["session_id"] = run.get("session_id") or snapshot.get("run_id")
+            _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+
+            # Keep persisted run snapshots reasonably fresh without writing on every tick.
+            now = time.time()
+            last_persist_at = float(run.get("last_progress_persist_at") or 0.0)
+            if now - last_persist_at < 1.0:
+                return
+            run["last_progress_persist_at"] = now
+            run_record = _build_run_record(run_id)
+            if run_record and _use_supabase_store():
+                await RUN_STORE.upsert_run(run_record)
+
         async def on_clarification(step_id: str, output: dict[str, Any]) -> str:
             run = RUNS.get(run_id)
             if not run:
@@ -580,6 +599,7 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
             multi_mcp=multi_mcp,
             event_callback=on_agent_activity,
             clarification_callback=on_clarification,
+            progress_callback=on_context_progress,
         )
 
         run_task = asyncio.create_task(
