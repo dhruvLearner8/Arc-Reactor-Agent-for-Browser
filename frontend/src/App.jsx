@@ -723,6 +723,8 @@ export default function App() {
 
   useEffect(() => {
     const isActiveRun =
+      !selectedRunMeta ||
+      selectedRunMeta?.status === "starting" ||
       selectedRunMeta?.status === "running" ||
       selectedRunMeta?.status === "queued" ||
       selectedRunMeta?.status === "pending";
@@ -815,6 +817,7 @@ export default function App() {
           }
           setIsStreaming(false);
           fetchRuns();
+          fetchRunDetail(selectedRunId);
           stream?.close();
         });
 
@@ -827,11 +830,13 @@ export default function App() {
           }
           setIsStreaming(false);
           fetchRuns();
+          fetchRunDetail(selectedRunId);
           stream?.close();
         });
 
         stream.onerror = () => {
           setIsStreaming(false);
+          fetchRunDetail(selectedRunId);
           stream?.close();
         };
       } catch (e) {
