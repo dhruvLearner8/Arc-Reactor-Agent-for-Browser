@@ -766,23 +766,59 @@ export default function App() {
     }
     let stream = null;
     let cancelled = false;
+    let pollTimer = null;
+    let isOpeningStream = false;
+
+    const clearPolling = () => {
+      if (pollTimer != null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
+
+    const startPolling = () => {
+      if (pollTimer != null) return;
+      pollTimer = window.setInterval(() => {
+        fetchRunDetail(selectedRunId);
+      }, 1500);
+    };
+
+    const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
     const initStream = async () => {
+      if (isOpeningStream) return;
+      isOpeningStream = true;
       try {
-        const ticketRes = await fetch(apiUrl(`/api/runs/${selectedRunId}/stream-ticket`), {
-          method: "POST",
-          headers: getAuthHeaders(),
-        });
-        if (ticketRes.status === 404) {
-          // Historical/completed runs are not streamable; skip quietly.
+        let ticketData = null;
+        let ticketError = null;
+        // Retry ticket acquisition for active runs to survive short race windows.
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          if (cancelled) return;
+          const ticketRes = await fetch(apiUrl(`/api/runs/${selectedRunId}/stream-ticket`), {
+            method: "POST",
+            headers: getAuthHeaders(),
+          });
+          if (ticketRes.ok) {
+            ticketData = await ticketRes.json();
+            break;
+          }
+          if (ticketRes.status !== 404) {
+            const detail = await readErrorMessage(ticketRes, "Failed to open stream (ticket denied)");
+            ticketError = new Error(detail);
+            break;
+          }
+          // 404 may be temporary while run state settles; retry briefly.
+          await sleep(400);
+        }
+        if (!ticketData) {
+          if (ticketError) throw ticketError;
+          // Fall back to detail polling when SSE cannot attach.
           setIsStreaming(false);
+          startPolling();
           return;
         }
-        if (!ticketRes.ok) {
-          throw new Error("Failed to open stream (ticket denied)");
-        }
-        const ticketData = await ticketRes.json();
         if (cancelled) return;
+        clearPolling();
         const ticketParam = encodeURIComponent(ticketData.ticket);
         stream = new EventSource(
           apiUrl(`/api/runs/${selectedRunId}/events?ticket=${ticketParam}`)
@@ -850,6 +886,7 @@ export default function App() {
           setIsStreaming(false);
           fetchRuns();
           fetchRunDetail(selectedRunId);
+          startPolling();
           stream?.close();
         });
 
@@ -863,17 +900,22 @@ export default function App() {
           setIsStreaming(false);
           fetchRuns();
           fetchRunDetail(selectedRunId);
+          startPolling();
           stream?.close();
         });
 
         stream.onerror = () => {
           setIsStreaming(false);
           fetchRunDetail(selectedRunId);
+          startPolling();
           stream?.close();
         };
       } catch (e) {
         setIsStreaming(false);
+        startPolling();
         setError(String(e));
+      } finally {
+        isOpeningStream = false;
       }
     };
     initStream();
@@ -881,6 +923,7 @@ export default function App() {
     return () => {
       cancelled = true;
       stream?.close();
+      clearPolling();
       setIsStreaming(false);
     };
   }, [selectedRunId, accessToken, selectedRunMeta?.status]);
