@@ -1,4 +1,4 @@
-
+import json
 from mcp.server.fastmcp import FastMCP, Context
 import httpx
 from bs4 import BeautifulSoup
@@ -11,6 +11,7 @@ from datetime import datetime
 import asyncio
 import os
 from dotenv import load_dotenv
+from mcp.types import TextContent
 
 # Browser Use Imports
 try:
@@ -44,7 +45,7 @@ async def web_search(string: str, integer: int = 5) -> str:
     """Search the web using multiple engines (DuckDuckGo, Bing, Ecosia, etc.) and return a list of relevant result URLs"""
     try:
         urls = await smart_search(string, integer)
-        return str(urls)
+        return json.dumps(urls)
     except Exception as e:
         return f"[Error] Search failed: {str(e)}"
 
@@ -58,6 +59,71 @@ async def web_extract_text(string: str) -> str:
         return text if text else "[Error] No text extracted"
     except Exception as e:
         return f"[Error] Extraction failed: {str(e)}"
+
+
+@mcp.tool()
+async def fetch_search_urls(string: str, integer: int = 5) -> str:
+    """Get top URLs for a query."""
+    try:
+        urls = await smart_search(string, integer)
+        return json.dumps(urls)
+    except Exception as e:
+        return f"[Error] Search failed: {str(e)}"
+
+
+@mcp.tool()
+async def webpage_url_to_raw_text(string: str) -> dict:
+    """Extract readable text from a single webpage URL."""
+    try:
+        result = await asyncio.wait_for(smart_web_extract(string), timeout=30)
+        return {
+            "content": [
+                TextContent(
+                    type="text",
+                    text=f"[{result.get('best_text_source', '')}] " + result.get("best_text", "")[:8000]
+                )
+            ]
+        }
+    except Exception as e:
+        return {
+            "content": [
+                TextContent(
+                    type="text",
+                    text=f"[error] Failed to extract: {str(e)}"
+                )
+            ]
+        }
+
+
+@mcp.tool()
+async def search_web_with_text_content(string: str) -> dict:
+    """Search and return URL+text payload for top results."""
+    try:
+        urls = await smart_search(string, 5)
+        if not urls:
+            return {
+                "content": [TextContent(type="text", text="[error] No search results found")]
+            }
+
+        results = []
+        for i, url in enumerate(urls[:5]):
+            try:
+                web_result = await asyncio.wait_for(smart_web_extract(url), timeout=20)
+                text_content = web_result.get("best_text", "")[:4000]
+                text_content = text_content.replace("\n", " ").replace("  ", " ").strip()
+                results.append(
+                    {
+                        "url": url,
+                        "content": text_content if text_content else "[error] No readable content found",
+                        "rank": i + 1,
+                    }
+                )
+            except Exception as e:
+                results.append({"url": url, "content": f"[error] {str(e)}", "rank": i + 1})
+
+        return {"content": [TextContent(type="text", text=json.dumps(results))]}
+    except Exception as e:
+        return {"content": [TextContent(type="text", text=f"[error] {str(e)}")]}
 
 # --- Tool 2: Deep Vision Browsing (Browser Use) ---
 

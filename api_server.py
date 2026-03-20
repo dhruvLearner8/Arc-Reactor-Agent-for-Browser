@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from auth import AuthUser, get_current_user
+from agents.base_agent import AgentRunner
 from core.loop import AgentLoop4
 from mcp_servers.multi_mcp import MultiMCP
 
@@ -33,6 +34,24 @@ class RunCreateRequest(BaseModel):
 class ClarificationSubmitRequest(BaseModel):
     response: str = Field(min_length=1, max_length=2000)
     clarification_id: str | None = None
+
+
+class FormatterFollowupRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+
+
+class NoteCreateRequest(BaseModel):
+    content: str = Field(default="", max_length=100000)
+    name: str = Field(default="untitled.txt", min_length=1, max_length=200)
+    kind: str = Field(default="file")
+    parent_id: str | None = None
+
+
+class NoteUpdateRequest(BaseModel):
+    content: str | None = Field(default=None, max_length=100000)
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    kind: str | None = None
+    parent_id: str | None = None
 
 
 class RunCreateResponse(BaseModel):
@@ -229,6 +248,37 @@ def _load_session_file(path: Path) -> dict[str, Any]:
 def _local_run_path(run_id: str) -> Path:
     LOCAL_RUNS_DIR.mkdir(parents=True, exist_ok=True)
     return LOCAL_RUNS_DIR / f"{run_id}.json"
+
+
+def _notes_dir() -> Path:
+    path = BASE_DIR / "memory" / "notes"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _notes_path(user_id: str) -> Path:
+    safe_user = user_id.replace("/", "_")
+    return _notes_dir() / f"{safe_user}.json"
+
+
+def _load_notes(user_id: str) -> list[dict[str, Any]]:
+    path = _notes_path(user_id)
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def _save_notes(user_id: str, notes: list[dict[str, Any]]) -> None:
+    path = _notes_path(user_id)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(notes, f, ensure_ascii=False, indent=2)
 
 
 def _save_local_run_record(run_id: str) -> None:
@@ -434,6 +484,271 @@ def _context_to_run_detail(context, status: str = "running") -> dict[str, Any]:
         "links": links,
         "globals_schema": graph.graph.get("globals_schema", {}),
     }
+
+
+def _extract_best_formatter_text(output: Any) -> str:
+    if isinstance(output, str):
+        text = output.strip()
+        return text
+    if not isinstance(output, dict):
+        return ""
+
+    preferred_keys = ["formatted_report", "formatted_output", "final_answer", "summary", "fallback_markdown"]
+    for key in preferred_keys:
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    for key, value in output.items():
+        if not isinstance(key, str):
+            continue
+        if not isinstance(value, str):
+            continue
+        lower = key.lower()
+        if lower.startswith("formatted_report") and value.strip():
+            return value.strip()
+
+    for _, value in output.items():
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _last_formatter_node(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    nodes = snapshot.get("nodes", []) if isinstance(snapshot, dict) else []
+    for node in reversed(nodes):
+        if not isinstance(node, dict):
+            continue
+        agent = str(node.get("agent", "")).lower()
+        if "formatter" in agent:
+            return node
+    return None
+
+
+def _next_followup_step_ids(snapshot: dict[str, Any], count: int, prefix: str = "FUPR") -> list[str]:
+    nodes = snapshot.get("nodes", []) if isinstance(snapshot, dict) else []
+    existing = {str(node.get("id")) for node in nodes if isinstance(node, dict) and node.get("id")}
+    ids: list[str] = []
+    counter = 1
+    while len(ids) < count:
+        candidate = f"{prefix}{counter:03d}"
+        if candidate not in existing and candidate not in ids:
+            ids.append(candidate)
+        counter += 1
+    return ids
+
+
+def _build_research_followup_query(
+    *,
+    base_query: str,
+    followup_prompt: str,
+    previous_answer: str,
+) -> str:
+    return (
+        f"{base_query}\n\n"
+        "---- Previous answer context ----\n"
+        f"{previous_answer}\n\n"
+        "---- Follow-up request ----\n"
+        f"{followup_prompt}\n\n"
+        "Use the follow-up request to do additional research and provide an improved answer. "
+        "Do not merely rephrase; gather stronger evidence and deeper detail."
+    )
+
+
+def _coerce_output_value(output: Any, write_key: str) -> Any:
+    if isinstance(output, dict):
+        if write_key in output:
+            return output[write_key]
+        extracted = _extract_best_formatter_text(output)
+        if extracted:
+            return extracted
+        return output
+    if isinstance(output, str):
+        return output.strip()
+    return output
+
+
+async def _run_research_followup_in_run(
+    *,
+    run_id: str,
+    node_ids: dict[str, str],
+    read_keys: dict[str, str],
+    write_keys: dict[str, str],
+    followup_query: str,
+    owner_user_id: str | None,
+) -> None:
+    run = RUNS.get(run_id)
+    if not run:
+        return
+
+    multi_mcp = MultiMCP()
+    runner = AgentRunner(multi_mcp)
+    try:
+        await multi_mcp.start()
+        run = RUNS.get(run_id)
+        if not run:
+            return
+        snapshot = run.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("Run snapshot unavailable for follow-up execution")
+        nodes = snapshot.get("nodes", [])
+        if not isinstance(nodes, list):
+            raise RuntimeError("Invalid node list in run snapshot")
+        globals_schema = snapshot.setdefault("globals_schema", {})
+        if not isinstance(globals_schema, dict):
+            raise RuntimeError("Invalid globals_schema in run snapshot")
+
+        async def execute_step(
+            step_id: str,
+            agent: str,
+            *,
+            reads: list[str],
+            writes: list[str],
+            agent_prompt: str,
+        ) -> dict[str, Any]:
+            node_ref = next((n for n in nodes if isinstance(n, dict) and n.get("id") == step_id), None)
+            if not isinstance(node_ref, dict):
+                raise RuntimeError(f"Follow-up node not found: {step_id}")
+
+            node_ref["status"] = "running"
+            node_ref["start_time"] = datetime.utcnow().isoformat()
+            run["status"] = "running"
+            snapshot["status"] = "running"
+            _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+
+            inputs = {key: globals_schema.get(key) for key in reads if key in globals_schema}
+            payload: dict[str, Any] = {
+                "step_id": step_id,
+                "agent_prompt": agent_prompt,
+                "reads": reads,
+                "writes": writes,
+                "inputs": inputs,
+            }
+            if agent == "FormatterAgent":
+                payload["all_globals_schema"] = dict(globals_schema)
+                payload["original_query"] = snapshot.get("query", run.get("query", ""))
+                payload["session_context"] = {
+                    "session_id": snapshot.get("session_id", run.get("session_id")),
+                    "created_at": snapshot.get("created_at", run.get("created_at")),
+                    "file_manifest": [],
+                }
+
+            result = await runner.run_agent(agent, payload)
+            if not result.get("success"):
+                raise RuntimeError(str(result.get("error") or f"{agent} failed"))
+            output = result.get("output", {}) or {}
+
+            for write_key in writes:
+                globals_schema[write_key] = _coerce_output_value(output, write_key)
+
+            node_ref["status"] = "completed"
+            node_ref["end_time"] = datetime.utcnow().isoformat()
+            node_ref["output"] = output
+            node_ref["error"] = None
+            _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+            return output if isinstance(output, dict) else {"output": output}
+
+        planner_output = await execute_step(
+            node_ids["planner"],
+            "PlannerAgent",
+            reads=[read_keys["previous_answer"], read_keys["followup_prompt"]],
+            writes=[write_keys["planner"]],
+            agent_prompt=(
+                "Create a focused follow-up research plan for this user request. "
+                "The plan should identify what facts to gather, what comparisons to make, and what answer structure to produce.\n\n"
+                f"Follow-up context query:\n{followup_query}"
+            ),
+        )
+        retriever_output = await execute_step(
+            node_ids["retriever"],
+            "RetrieverAgent",
+            reads=[read_keys["previous_answer"], read_keys["followup_prompt"], write_keys["planner"]],
+            writes=[write_keys["retriever"]],
+            agent_prompt=(
+                "Gather evidence and concrete data needed by the follow-up plan. "
+                "Prioritize current, source-backed details."
+            ),
+        )
+        thinker_output = await execute_step(
+            node_ids["thinker"],
+            "ThinkerAgent",
+            reads=[write_keys["planner"], write_keys["retriever"]],
+            writes=[write_keys["thinker"]],
+            agent_prompt="Reason over retrieved evidence and produce clear conclusions, trade-offs, and recommendations.",
+        )
+        await execute_step(
+            node_ids["distiller"],
+            "DistillerAgent",
+            reads=[write_keys["thinker"]],
+            writes=[write_keys["distiller"]],
+            agent_prompt="Distill follow-up analysis into concise, high-signal bullet points and structured themes.",
+        )
+        await execute_step(
+            node_ids["qa"],
+            "QAAgent",
+            reads=[write_keys["distiller"], write_keys["retriever"]],
+            writes=[write_keys["qa"]],
+            agent_prompt=(
+                "Validate follow-up answer quality for coverage, factual grounding, and clarity. "
+                "Return verdict and concrete issues if any."
+            ),
+        )
+        await execute_step(
+            node_ids["formatter"],
+            "FormatterAgent",
+            reads=[write_keys["planner"], write_keys["retriever"], write_keys["thinker"], write_keys["distiller"], write_keys["qa"]],
+            writes=[write_keys["formatter"]],
+            agent_prompt=(
+                "Produce a polished follow-up answer for the user. "
+                "Be practical, detailed, and directly aligned with the follow-up request."
+            ),
+        )
+
+        run["status"] = "completed"
+        snapshot["status"] = "completed"
+        run["error"] = None
+        _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+        _publish_event(run_id, {"status": "completed", "snapshot": snapshot}, event="run_complete")
+        run_record = _build_run_record(run_id)
+        if run_record and _use_supabase_store():
+            await RUN_STORE.upsert_run(run_record)
+        if _use_supabase_store():
+            await RUN_STORE.insert_log(
+                level="INFO",
+                event_type="run_followup_completed",
+                message="In-run research follow-up completed",
+                owner_user_id=owner_user_id,
+                run_id=run_id,
+                payload={"node_ids": node_ids, "retriever_keys": list(retriever_output.keys()), "thinker_keys": list(thinker_output.keys()), "planner_keys": list(planner_output.keys())},
+            )
+    except Exception as exc:
+        run = RUNS.get(run_id)
+        if run and isinstance(run.get("snapshot"), dict):
+            snapshot = run["snapshot"]
+            nodes = snapshot.get("nodes", [])
+            for sid in node_ids.values():
+                node_ref = next((n for n in nodes if isinstance(n, dict) and n.get("id") == sid), None)
+                if isinstance(node_ref, dict) and node_ref.get("status") in {"pending", "running"}:
+                    node_ref["status"] = "failed"
+                    node_ref["error"] = str(exc)
+                    node_ref["end_time"] = datetime.utcnow().isoformat()
+            run["status"] = "failed"
+            run["error"] = str(exc)
+            snapshot["status"] = "failed"
+            snapshot["error"] = str(exc)
+            _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+            _publish_event(run_id, {"status": "failed", "error": str(exc)}, event="run_error")
+        if _use_supabase_store():
+            await RUN_STORE.insert_log(
+                level="ERROR",
+                event_type="run_followup_failed",
+                message="In-run research follow-up failed",
+                owner_user_id=owner_user_id,
+                run_id=run_id,
+                payload={"error": str(exc), "node_ids": node_ids},
+            )
+    finally:
+        await multi_mcp.stop()
 
 
 def _serialize_sse(data: dict[str, Any], event: str = "message") -> str:
@@ -741,6 +1056,114 @@ async def me(current_user: AuthUser = Depends(get_current_user)) -> dict[str, An
     return {"user_id": current_user.user_id, "email": current_user.email}
 
 
+@app.get("/api/notes")
+async def list_notes(current_user: AuthUser = Depends(get_current_user)) -> list[dict[str, Any]]:
+    notes = _load_notes(current_user.user_id)
+    for note in notes:
+        note["kind"] = (note.get("kind") or "file").strip().lower()
+        note["name"] = (note.get("name") or "untitled.txt").strip() or "untitled.txt"
+        if "parent_id" not in note:
+            note["parent_id"] = None
+        if note["kind"] == "folder":
+            note["content"] = ""
+        else:
+            note["content"] = str(note.get("content") or "")
+    notes.sort(key=lambda n: (n.get("updated_at") or n.get("created_at") or ""), reverse=True)
+    return notes
+
+
+@app.post("/api/notes")
+async def create_note(
+    request: NoteCreateRequest, current_user: AuthUser = Depends(get_current_user)
+) -> dict[str, Any]:
+    notes = _load_notes(current_user.user_id)
+    kind = (request.kind or "file").strip().lower()
+    if kind not in {"file", "folder"}:
+        raise HTTPException(status_code=400, detail="Invalid note kind")
+    name = (request.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    if kind == "file" and not name.lower().endswith(".md"):
+        name = f"{name}.md"
+    if request.parent_id:
+        parent = next((n for n in notes if n.get("id") == request.parent_id), None)
+        if not parent:
+            raise HTTPException(status_code=400, detail="Parent folder not found")
+        if (parent.get("kind") or "file").strip().lower() != "folder":
+            raise HTTPException(status_code=400, detail="Parent must be a folder")
+    now = datetime.utcnow().isoformat()
+    note = {
+        "id": f"note_{uuid4().hex[:10]}",
+        "name": name,
+        "kind": kind,
+        "parent_id": request.parent_id,
+        "content": "" if kind == "folder" else (request.content or ""),
+        "created_at": now,
+        "updated_at": now,
+    }
+    notes.insert(0, note)
+    _save_notes(current_user.user_id, notes)
+    return note
+
+
+@app.put("/api/notes/{note_id}")
+async def update_note(
+    note_id: str, request: NoteUpdateRequest, current_user: AuthUser = Depends(get_current_user)
+) -> dict[str, Any]:
+    notes = _load_notes(current_user.user_id)
+    for note in notes:
+        if note.get("id") == note_id:
+            if request.name is not None:
+                name = request.name.strip()
+                if not name:
+                    raise HTTPException(status_code=400, detail="Name cannot be empty")
+                note["name"] = name
+            if request.kind is not None:
+                next_kind = request.kind.strip().lower()
+                if next_kind not in {"file", "folder"}:
+                    raise HTTPException(status_code=400, detail="Invalid note kind")
+                note["kind"] = next_kind
+                if next_kind == "folder":
+                    note["content"] = ""
+            if request.parent_id is not None:
+                if request.parent_id == note_id:
+                    raise HTTPException(status_code=400, detail="Cannot set item as its own parent")
+                parent = next((n for n in notes if n.get("id") == request.parent_id), None)
+                if not parent:
+                    raise HTTPException(status_code=400, detail="Parent folder not found")
+                if (parent.get("kind") or "file").strip().lower() != "folder":
+                    raise HTTPException(status_code=400, detail="Parent must be a folder")
+                note["parent_id"] = request.parent_id
+            if request.content is not None and (note.get("kind") or "file") != "folder":
+                note["content"] = request.content
+            note["updated_at"] = datetime.utcnow().isoformat()
+            _save_notes(current_user.user_id, notes)
+            return note
+    raise HTTPException(status_code=404, detail="Note not found")
+
+
+@app.delete("/api/notes/{note_id}")
+async def delete_note(note_id: str, current_user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    notes = _load_notes(current_user.user_id)
+    note_ids = {n.get("id") for n in notes}
+    if note_id not in note_ids:
+        raise HTTPException(status_code=404, detail="Note not found")
+    to_delete = {note_id}
+    changed = True
+    while changed:
+        changed = False
+        for n in notes:
+            nid = n.get("id")
+            if nid in to_delete:
+                continue
+            if n.get("parent_id") in to_delete:
+                to_delete.add(nid)
+                changed = True
+    filtered = [n for n in notes if n.get("id") not in to_delete]
+    _save_notes(current_user.user_id, filtered)
+    return {"status": "deleted", "id": note_id, "deleted_count": len(to_delete)}
+
+
 @app.get("/api/admin/logs")
 async def admin_logs(
     limit: int = 500,
@@ -862,6 +1285,216 @@ async def submit_clarification(
     pending["response"] = response
     pending["responded_at"] = datetime.utcnow().isoformat()
     return {"status": "accepted", "run_id": run_id, "clarification_id": pending.get("id")}
+
+
+@app.post("/api/runs/{run_id}/formatter-followup")
+async def submit_formatter_followup(
+    run_id: str,
+    request: FormatterFollowupRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not active")
+    if not _run_belongs_to_user(run, current_user.user_id):
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+    snapshot: dict[str, Any] | None = run.get("snapshot") if isinstance(run.get("snapshot"), dict) else None
+    base_query = str(run.get("query") or "")
+
+    if not snapshot:
+        raise HTTPException(status_code=409, detail="Run snapshot unavailable for follow-up")
+
+    prompt = request.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Follow-up prompt cannot be empty")
+
+    parent_formatter = _last_formatter_node(snapshot)
+    if not parent_formatter:
+        raise HTTPException(status_code=409, detail="No formatter output available for follow-up")
+    previous_answer = _extract_best_formatter_text(parent_formatter.get("output"))
+    if not previous_answer:
+        previous_answer = "Previous answer unavailable."
+
+    if run and run.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Run is currently busy. Try again in a moment.")
+
+    followup_query = _build_research_followup_query(
+        base_query=base_query or str(snapshot.get("query") or ""),
+        followup_prompt=prompt,
+        previous_answer=previous_answer,
+    )
+    step_ids = _next_followup_step_ids(snapshot, 6, prefix="FUPR")
+    planner_id, retriever_id, thinker_id, distiller_id, qa_id, formatter_id = step_ids
+
+    nodes = snapshot.setdefault("nodes", [])
+    links = snapshot.setdefault("links", [])
+    globals_schema = snapshot.setdefault("globals_schema", {})
+    if not isinstance(nodes, list) or not isinstance(links, list) or not isinstance(globals_schema, dict):
+        raise HTTPException(status_code=500, detail="Corrupt run snapshot structure")
+
+    read_previous_answer = f"followup_previous_answer_{planner_id}"
+    read_followup_prompt = f"followup_prompt_{planner_id}"
+    write_planner = f"followup_plan_{planner_id}"
+    write_retriever = f"followup_retrieval_{retriever_id}"
+    write_thinker = f"followup_reasoning_{thinker_id}"
+    write_distiller = f"followup_distilled_{distiller_id}"
+    write_qa = f"followup_qa_{qa_id}"
+    write_formatter = f"followup_final_{formatter_id}"
+
+    globals_schema[read_previous_answer] = previous_answer
+    globals_schema[read_followup_prompt] = prompt
+
+    new_nodes = [
+        {
+            "id": planner_id,
+            "agent": "PlannerAgent",
+            "description": "Follow-up planning for deeper research",
+            "agent_prompt": "Plan the deeper follow-up research steps.",
+            "reads": [read_previous_answer, read_followup_prompt],
+            "writes": [write_planner],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+        {
+            "id": retriever_id,
+            "agent": "RetrieverAgent",
+            "description": "Retrieve follow-up evidence",
+            "agent_prompt": "Collect follow-up evidence with sources.",
+            "reads": [read_previous_answer, read_followup_prompt, write_planner],
+            "writes": [write_retriever],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+        {
+            "id": thinker_id,
+            "agent": "ThinkerAgent",
+            "description": "Analyze follow-up evidence",
+            "agent_prompt": "Analyze follow-up evidence and trade-offs.",
+            "reads": [write_planner, write_retriever],
+            "writes": [write_thinker],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+        {
+            "id": distiller_id,
+            "agent": "DistillerAgent",
+            "description": "Distill follow-up findings",
+            "agent_prompt": "Distill follow-up findings into concise insights.",
+            "reads": [write_thinker],
+            "writes": [write_distiller],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+        {
+            "id": qa_id,
+            "agent": "QAAgent",
+            "description": "Validate follow-up quality",
+            "agent_prompt": "Validate follow-up quality and identify issues.",
+            "reads": [write_distiller, write_retriever],
+            "writes": [write_qa],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+        {
+            "id": formatter_id,
+            "agent": "FormatterAgent",
+            "description": "Format final follow-up answer",
+            "agent_prompt": "Generate final follow-up answer for the user.",
+            "reads": [write_planner, write_retriever, write_thinker, write_distiller, write_qa],
+            "writes": [write_formatter],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+    ]
+    nodes.extend(new_nodes)
+    links.extend(
+        [
+            {"source": str(parent_formatter.get("id")), "target": planner_id},
+            {"source": planner_id, "target": retriever_id},
+            {"source": retriever_id, "target": thinker_id},
+            {"source": thinker_id, "target": distiller_id},
+            {"source": distiller_id, "target": qa_id},
+            {"source": qa_id, "target": formatter_id},
+        ]
+    )
+
+    if run:
+        run["status"] = "running"
+        run["error"] = None
+        snapshot["status"] = "running"
+        _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+        run_record = _build_run_record(run_id)
+        if run_record and _use_supabase_store():
+            await RUN_STORE.upsert_run(run_record)
+
+    if _use_supabase_store():
+        await RUN_STORE.insert_log(
+            level="INFO",
+            event_type="run_followup_created",
+            message="In-run research follow-up graph created",
+            owner_user_id=current_user.user_id,
+            run_id=run_id,
+            payload={"followup_prompt": prompt, "node_ids": step_ids},
+        )
+
+    asyncio.create_task(
+        _run_research_followup_in_run(
+            run_id=run_id,
+            node_ids={
+                "planner": planner_id,
+                "retriever": retriever_id,
+                "thinker": thinker_id,
+                "distiller": distiller_id,
+                "qa": qa_id,
+                "formatter": formatter_id,
+            },
+            read_keys={
+                "previous_answer": read_previous_answer,
+                "followup_prompt": read_followup_prompt,
+            },
+            write_keys={
+                "planner": write_planner,
+                "retriever": write_retriever,
+                "thinker": write_thinker,
+                "distiller": write_distiller,
+                "qa": write_qa,
+                "formatter": write_formatter,
+            },
+            followup_query=followup_query,
+            owner_user_id=current_user.user_id,
+        )
+    )
+    return {"status": "accepted", "run_id": run_id, "mode": "research_in_run", "added_nodes": step_ids}
 
 
 @app.get("/api/runs/{run_id}/events")

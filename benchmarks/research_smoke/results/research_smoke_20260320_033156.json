@@ -1,0 +1,72 @@
+{
+  "generated_at": "2026-03-20T03:31:56.002302",
+  "total_cases": 4,
+  "passed": 3,
+  "failed": 1,
+  "errors": 0,
+  "results": [
+    {
+      "id": "RS001",
+      "status": "passed",
+      "duration_sec": 322.32,
+      "failed_steps": 0,
+      "completed_steps": 12,
+      "total_cost": 0.0022486,
+      "quality": {
+        "keyword_hits": [
+          "pricing",
+          "integration",
+          "recommendation"
+        ],
+        "keyword_hit_rate": 1.0,
+        "answer_length": 6348
+      }
+    },
+    {
+      "id": "RS002",
+      "status": "passed",
+      "duration_sec": 194.26,
+      "failed_steps": 0,
+      "completed_steps": 6,
+      "total_cost": 0.0007285,
+      "quality": {
+        "keyword_hits": [
+          "source",
+          "market",
+          "estimate"
+        ],
+        "keyword_hit_rate": 1.0,
+        "answer_length": 3211
+      }
+    },
+    {
+      "id": "RS003",
+      "status": "passed",
+      "duration_sec": 173.5,
+      "failed_steps": 0,
+      "completed_steps": 9,
+      "total_cost": 0.0010153,
+      "quality": {
+        "keyword_hits": [
+          "kyoto",
+          "amenities"
+        ],
+        "keyword_hit_rate": 0.667,
+        "answer_length": 2845
+      }
+    },
+    {
+      "id": "RS004",
+      "status": "failed",
+      "duration_sec": 292.85,
+      "failed_steps": 0,
+      "completed_steps": 12,
+      "total_cost": 0.0019982000000000003,
+      "quality": {
+        "keyword_hits": [],
+        "keyword_hit_rate": 0.0,
+        "answer_length": 14
+      }
+    }
+  ]
+}

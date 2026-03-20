@@ -16,6 +16,7 @@ def print(*args, **kwargs):
 SEARCH_ENGINES = [
     "duck_http",
     "duck_playwright",
+    "bing_playwright",
     "yahoo_playwright",
     "ecosia_playwright",
     "mojeek_playwright"
@@ -163,9 +164,10 @@ async def use_playwright_search(query: str, engine: str) -> List[str]:
     return urls
 
 async def smart_search(query: str, limit: int = 5) -> List[str]:
-    random.shuffle(SEARCH_ENGINES)
+    # Keep deterministic order so the fastest/most reliable engines are tried first.
+    engine_order = list(SEARCH_ENGINES)
 
-    for engine in SEARCH_ENGINES:
+    for engine in engine_order:
         print(f"Trying engine: {engine}")
         try:
             if engine == "duck_http":

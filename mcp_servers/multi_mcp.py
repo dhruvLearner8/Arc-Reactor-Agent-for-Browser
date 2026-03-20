@@ -8,6 +8,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import Tool
 from rich import print
+from core.circuit_breaker import get_breaker, CircuitOpenError
 
 class MultiMCP:
     def __init__(self):
@@ -125,8 +126,23 @@ class MultiMCP:
 
     # Helper to route tool call by finding which server has it
     async def route_tool_call(self, tool_name: str, arguments: dict):
-        for name, tools in self.tools.items():
-            for tool in tools:
-                if tool.name == tool_name:
-                    return await self.call_tool(name, tool_name, arguments)
-        raise ValueError(f"Tool '{tool_name}' not found in any server")
+        breaker = get_breaker(tool_name, failure_threshold=5, recovery_timeout=60.0)
+        if not breaker.can_execute():
+            status = breaker.get_status()
+            raise CircuitOpenError(
+                f"Circuit open for '{tool_name}'. Retry in {status['time_until_retry']:.0f}s"
+            )
+
+        try:
+            for name, tools in self.tools.items():
+                for tool in tools:
+                    if tool.name == tool_name:
+                        result = await self.call_tool(name, tool_name, arguments)
+                        breaker.record_success()
+                        return result
+            raise ValueError(f"Tool '{tool_name}' not found in any server")
+        except CircuitOpenError:
+            raise
+        except Exception:
+            breaker.record_failure()
+            raise

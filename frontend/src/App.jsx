@@ -468,14 +468,34 @@ export default function App() {
   const [creatingRun, setCreatingRun] = useState(false);
   const [error, setError] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
-  const [viewMode, setViewMode] = useState("rendered");
+  const [viewMode, setViewMode] = useState("preview");
   const [inspectorExpanded, setInspectorExpanded] = useState(false);
   const [sampleQueriesOpen, setSampleQueriesOpen] = useState(false);
   const [clarificationCollapsed, setClarificationCollapsed] = useState(true);
   const [clarificationResponse, setClarificationResponse] = useState("");
   const [clarificationSubmitting, setClarificationSubmitting] = useState(false);
   const [clarificationPanelHeight, setClarificationPanelHeight] = useState(340);
+  const [formatterFollowupPrompt, setFormatterFollowupPrompt] = useState("");
+  const [formatterFollowupSubmitting, setFormatterFollowupSubmitting] = useState(false);
   const [etaNowMs, setEtaNowMs] = useState(Date.now());
+  const [activeSection, setActiveSection] = useState("run");
+  const [notes, setNotes] = useState([]);
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [savingNote, setSavingNote] = useState(false);
+  const [creatingNodeType, setCreatingNodeType] = useState("");
+  const [creatingNodeName, setCreatingNodeName] = useState("");
+  const [creatingParentId, setCreatingParentId] = useState(null);
+  const [selectedNoteId, setSelectedNoteId] = useState("");
+  const [noteEditorContent, setNoteEditorContent] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [openNoteTabs, setOpenNoteTabs] = useState([]);
+  const [activeNoteTabId, setActiveNoteTabId] = useState("");
+  const [expandedFolders, setExpandedFolders] = useState({});
+  const [editorFont, setEditorFont] = useState("Consolas");
+  const [editorFontSize, setEditorFontSize] = useState("14");
+  const noteEditorRef = useRef(null);
+  const lastSavedContentByIdRef = useRef({});
+  const inlineCreateSubmittingRef = useRef(false);
   const autoFocusedFormatterRunRef = useRef(new Set());
   const clarificationPanelRef = useRef(null);
   const accessToken = session?.access_token ?? "";
@@ -488,6 +508,31 @@ export default function App() {
     () => runs.find((r) => r.run_id === selectedRunId) ?? null,
     [runs, selectedRunId]
   );
+  const selectedNote = useMemo(
+    () => notes.find((n) => n.id === activeNoteTabId) ?? null,
+    [notes, activeNoteTabId]
+  );
+  const selectedTreeItem = useMemo(
+    () => notes.find((n) => n.id === selectedNoteId) ?? null,
+    [notes, selectedNoteId]
+  );
+  const treeChildren = useMemo(() => {
+    const bucket = {};
+    notes.forEach((item) => {
+      const parent = item.parent_id || "__root__";
+      if (!bucket[parent]) bucket[parent] = [];
+      bucket[parent].push(item);
+    });
+    Object.keys(bucket).forEach((key) => {
+      bucket[key].sort((a, b) => {
+        const aCreated = String(a.created_at || "");
+        const bCreated = String(b.created_at || "");
+        if (aCreated && bCreated && aCreated !== bCreated) return aCreated.localeCompare(bCreated);
+        return String(a.id || "").localeCompare(String(b.id || ""));
+      });
+    });
+    return bucket;
+  }, [notes]);
 
   const shouldBlinkFormatter = useMemo(
     () => runDetail?.status === "completed",
@@ -669,6 +714,272 @@ export default function App() {
     }
   }
 
+  async function submitFormatterFollowup() {
+    if (!selectedRunId || !accessToken || !formatterFollowupPrompt.trim()) return;
+    setFormatterFollowupSubmitting(true);
+    setError("");
+    try {
+      const res = await fetch(apiUrl(`/api/runs/${selectedRunId}/formatter-followup`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({ prompt: formatterFollowupPrompt.trim() }),
+      });
+      if (!res.ok) {
+        const detail = await readErrorMessage(res, "Failed to submit formatter follow-up");
+        throw new Error(detail);
+      }
+      const data = await res.json();
+      setFormatterFollowupPrompt("");
+      await fetchRuns();
+      if (data?.run_id && String(data.run_id).startsWith("run_")) {
+        if (data.run_id === selectedRunId) {
+          await fetchRunDetail(selectedRunId);
+        } else {
+          setSelectedRunId(data.run_id);
+        }
+      } else {
+        await fetchRunDetail(selectedRunId);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setFormatterFollowupSubmitting(false);
+    }
+  }
+
+  async function fetchNotes() {
+    if (!accessToken) {
+      setNotes([]);
+      return;
+    }
+    setNotesLoading(true);
+    try {
+      const res = await fetch(apiUrl("/api/notes"), { headers: getAuthHeaders() });
+      if (!res.ok) {
+        const detail = await readErrorMessage(res, "Failed to load notes");
+        throw new Error(detail);
+      }
+      const data = await res.json();
+      const incoming = (Array.isArray(data) ? data : []).map((item) => {
+        const rawContent = item.content || "";
+        const safeId = String(item.id || "").replace(/^note_/, "").slice(0, 8) || "file";
+        const rawName = String(item.name || "").trim();
+        const normalizedName = isLikelyBadLegacyName(rawName)
+          ? `untitled-${safeId}.md`
+          : (rawName.toLowerCase().endsWith(".md") ? rawName : `${rawName}.md`);
+        return {
+          ...item,
+          kind: item.kind === "folder" ? "folder" : "file",
+          name: item.kind === "folder"
+            ? (isLikelyBadLegacyName(rawName) ? `folder-${safeId}` : rawName)
+            : normalizedName,
+          content: typeof rawContent === "string" ? rawContent : String(rawContent || ""),
+          parent_id: item.parent_id || null,
+        };
+      });
+      setNotes(incoming);
+      const snapshot = {};
+      incoming.forEach((item) => {
+        if (item.kind !== "folder") snapshot[item.id] = String(item.content || "");
+      });
+      lastSavedContentByIdRef.current = snapshot;
+      if (!selectedNoteId && incoming.length) {
+        setSelectedNoteId(incoming[0].id);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setNotesLoading(false);
+    }
+  }
+
+  function openFileTab(noteId) {
+    const note = notes.find((n) => n.id === noteId);
+    if (!note || note.kind === "folder") return;
+    setOpenNoteTabs((prev) => (prev.includes(noteId) ? prev : [...prev, noteId]));
+    setActiveNoteTabId(noteId);
+    setSelectedNoteId(noteId);
+  }
+
+  function normalizeMarkdownName(rawName) {
+    const base = String(rawName || "").trim().replace(/[\\/:*?"<>|]+/g, "");
+    if (!base) return "";
+    return base.toLowerCase().endsWith(".md") ? base : `${base}.md`;
+  }
+
+  function isLikelyBadLegacyName(rawName) {
+    const name = String(rawName || "").trim();
+    if (!name) return true;
+    const hasExt = /\.[a-z0-9]{1,8}$/i.test(name);
+    const spaces = (name.match(/\s/g) || []).length;
+    if (name.length > 64) return true;
+    if (!hasExt && spaces >= 4) return true;
+    return false;
+  }
+
+  async function createNote(rawName = "") {
+    const name = normalizeMarkdownName(rawName);
+    if (!name || !accessToken) return null;
+    setSavingNote(true);
+    try {
+      const parentId =
+        creatingParentId ??
+        (selectedTreeItem?.kind === "folder" ? selectedTreeItem.id : selectedTreeItem?.parent_id || null);
+      const res = await fetch(apiUrl("/api/notes"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({ kind: "file", name, parent_id: parentId, content: "" }),
+      });
+      if (!res.ok) {
+        const detail = await readErrorMessage(res, "Failed to create file");
+        throw new Error(detail);
+      }
+      const created = await res.json();
+      setNotes((prev) => [...prev, created]);
+      setSelectedNoteId(created.id);
+      setOpenNoteTabs((prev) => (prev.includes(created.id) ? prev : [...prev, created.id]));
+      setActiveNoteTabId(created.id);
+      setNoteEditorContent(created.content || "");
+      lastSavedContentByIdRef.current[created.id] = String(created.content || "");
+      return created;
+    } catch (e) {
+      setError(String(e));
+      return null;
+    } finally {
+      setSavingNote(false);
+    }
+  }
+
+  async function createFolder(rawName = "") {
+    const name = String(rawName || "").trim().replace(/[\\/:*?"<>|]+/g, "");
+    if (!name || !accessToken) return null;
+    setSavingNote(true);
+    try {
+      const parentId =
+        creatingParentId ??
+        (selectedTreeItem?.kind === "folder" ? selectedTreeItem.id : selectedTreeItem?.parent_id || null);
+      const res = await fetch(apiUrl("/api/notes"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({ kind: "folder", name, parent_id: parentId }),
+      });
+      if (!res.ok) {
+        const detail = await readErrorMessage(res, "Failed to create folder");
+        throw new Error(detail);
+      }
+      const created = await res.json();
+      setNotes((prev) => [...prev, created]);
+      setSelectedNoteId(created.id);
+      setExpandedFolders((prev) => ({ ...prev, [created.id]: true }));
+      return created;
+    } catch (e) {
+      setError(String(e));
+      return null;
+    } finally {
+      setSavingNote(false);
+    }
+  }
+
+  function beginInlineCreate(type) {
+    const parentId =
+      selectedTreeItem?.kind === "folder" ? selectedTreeItem.id : selectedTreeItem?.parent_id || null;
+    setCreatingNodeType(type);
+    setCreatingNodeName("");
+    setCreatingParentId(parentId);
+    if (parentId) {
+      setExpandedFolders((prev) => ({ ...prev, [parentId]: true }));
+    }
+  }
+
+  async function submitInlineCreate() {
+    const value = creatingNodeName.trim();
+    if (!value || !creatingNodeType || inlineCreateSubmittingRef.current) return;
+    inlineCreateSubmittingRef.current = true;
+    const created =
+      creatingNodeType === "folder" ? await createFolder(value) : await createNote(value);
+    if (created) {
+      setCreatingNodeType("");
+      setCreatingNodeName("");
+      setCreatingParentId(null);
+    }
+    inlineCreateSubmittingRef.current = false;
+  }
+
+  function cancelInlineCreate() {
+    setCreatingNodeType("");
+    setCreatingNodeName("");
+    setCreatingParentId(null);
+  }
+
+  async function saveSelectedNote() {
+    const noteId = activeNoteTabId;
+    if (!noteId || !accessToken) return false;
+    const contentToSave = String(noteEditorContent || "");
+    if (lastSavedContentByIdRef.current[noteId] === contentToSave) return true;
+    setNoteSaving(true);
+    try {
+      const res = await fetch(apiUrl(`/api/notes/${noteId}`), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({ content: contentToSave }),
+      });
+      if (!res.ok) {
+        const detail = await readErrorMessage(res, "Failed to update note");
+        throw new Error(detail);
+      }
+      const updated = await res.json();
+      setNotes((prev) => prev.map((n) => (n.id === noteId ? { ...n, ...updated, content: contentToSave } : n)));
+      lastSavedContentByIdRef.current[noteId] = contentToSave;
+      return true;
+    } catch (e) {
+      setError(String(e));
+      return false;
+    } finally {
+      setNoteSaving(false);
+    }
+  }
+
+  async function removeNote(noteId) {
+    if (!accessToken) return;
+    try {
+      const res = await fetch(apiUrl(`/api/notes/${noteId}`), {
+        method: "DELETE",
+        headers: getAuthHeaders(),
+      });
+      if (!res.ok) {
+        const detail = await readErrorMessage(res, "Failed to delete note");
+        throw new Error(detail);
+      }
+      setNotes((prev) => {
+        const deleted = new Set([noteId]);
+        let changed = true;
+        while (changed) {
+          changed = false;
+          prev.forEach((item) => {
+            if (!deleted.has(item.id) && deleted.has(item.parent_id)) {
+              deleted.add(item.id);
+              changed = true;
+            }
+          });
+        }
+        const remaining = prev.filter((n) => !deleted.has(n.id));
+        deleted.forEach((id) => delete lastSavedContentByIdRef.current[id]);
+        setOpenNoteTabs((tabs) => tabs.filter((id) => !deleted.has(id)));
+        if (deleted.has(activeNoteTabId)) {
+          const nextFile = remaining.find((n) => n.kind !== "folder");
+          setActiveNoteTabId(nextFile?.id || "");
+          setNoteEditorContent(nextFile?.content || "");
+        }
+        if (deleted.has(selectedNoteId)) {
+          setSelectedNoteId(remaining[0]?.id || "");
+        }
+        return remaining;
+      });
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   useEffect(() => {
     let mounted = true;
     supabase.auth
@@ -698,6 +1009,124 @@ export default function App() {
   }, [accessToken, authLoading]);
 
   useEffect(() => {
+    if (!authLoading) fetchNotes();
+  }, [accessToken, authLoading]);
+
+  useEffect(() => {
+    if (!selectedNote) {
+      setNoteEditorContent("");
+      return;
+    }
+    setNoteEditorContent(selectedNote.content || "");
+  }, [selectedNote]);
+
+  useEffect(() => {
+    if (!accessToken || !activeNoteTabId || !selectedNote || selectedNote.kind === "folder") return;
+    const current = String(noteEditorContent || "");
+    const saved = lastSavedContentByIdRef.current[activeNoteTabId];
+    if (saved === undefined) {
+      lastSavedContentByIdRef.current[activeNoteTabId] = String(selectedNote.content || "");
+      return;
+    }
+    if (saved === current) return;
+    const timer = window.setTimeout(() => {
+      saveSelectedNote();
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [accessToken, activeNoteTabId, noteEditorContent, selectedNote]);
+
+  useEffect(() => {
+    const fileIds = new Set(notes.filter((n) => n.kind !== "folder").map((n) => n.id));
+    setOpenNoteTabs((prev) => prev.filter((id) => fileIds.has(id)));
+    if (activeNoteTabId && fileIds.has(activeNoteTabId)) return;
+    const firstOpen = openNoteTabs.find((id) => fileIds.has(id));
+    if (firstOpen) {
+      setActiveNoteTabId(firstOpen);
+      return;
+    }
+    const firstFile = notes.find((n) => n.kind !== "folder");
+    setActiveNoteTabId(firstFile?.id || "");
+  }, [notes, activeNoteTabId, openNoteTabs]);
+
+  const noteLabel = (note) => {
+    const safeId = String(note?.id || "").replace(/^note_/, "").slice(0, 8) || "file";
+    const rawName = String(note?.name || "").trim().replace(/[\\/:*?"<>|]+/g, "");
+    if ((note?.kind || "file") === "folder") {
+      return isLikelyBadLegacyName(rawName) ? `folder-${safeId}` : rawName;
+    }
+    if (!rawName || isLikelyBadLegacyName(rawName)) return `untitled-${safeId}.md`;
+    return rawName.toLowerCase().endsWith(".md") ? rawName : `${rawName}.md`;
+  };
+  const noteStats = useMemo(() => {
+    const text = String(noteEditorContent || "").replace(/<[^>]*>/g, " ");
+    const words = text.trim() ? text.trim().split(/\s+/).length : 0;
+    return { chars: text.length, words };
+  }, [noteEditorContent]);
+  const openTabNotes = useMemo(
+    () => openNoteTabs.map((id) => notes.find((n) => n.id === id)).filter(Boolean),
+    [openNoteTabs, notes]
+  );
+
+  useEffect(() => {
+    if (!noteEditorRef.current) return;
+    if (noteEditorRef.current.innerHTML !== (noteEditorContent || "")) {
+      noteEditorRef.current.innerHTML = noteEditorContent || "";
+    }
+  }, [noteEditorContent, activeNoteTabId]);
+
+  function closeTab(noteId) {
+    setOpenNoteTabs((prev) => {
+      const remaining = prev.filter((id) => id !== noteId);
+      if (activeNoteTabId === noteId) {
+        const nextId = remaining[remaining.length - 1] || "";
+        setActiveNoteTabId(nextId);
+        const nextNote = notes.find((n) => n.id === nextId);
+        setNoteEditorContent(nextNote?.content || "");
+      }
+      return remaining;
+    });
+  }
+
+  function toggleFolder(folderId) {
+    setExpandedFolders((prev) => ({ ...prev, [folderId]: !prev[folderId] }));
+  }
+
+  function execEditorCommand(command, value = null) {
+    if (!noteEditorRef.current || !activeNoteTabId) return;
+    noteEditorRef.current.focus();
+    document.execCommand(command, false, value);
+    setNoteEditorContent(noteEditorRef.current.innerHTML);
+  }
+
+  function renderTreeNodes(parentId = null, depth = 0) {
+    const list = treeChildren[parentId || "__root__"] || [];
+    return list.map((item) => {
+      const isFolder = item.kind === "folder";
+      const isExpanded = expandedFolders[item.id] ?? true;
+      return (
+        <div key={item.id}>
+          <button
+            className={`note-tree-item ${selectedNoteId === item.id ? "active" : ""}`}
+            style={{ paddingLeft: `${8 + depth * 16}px` }}
+            onClick={() => {
+              setSelectedNoteId(item.id);
+              if (isFolder) {
+                toggleFolder(item.id);
+              } else {
+                openFileTab(item.id);
+              }
+            }}
+          >
+            <span className="note-tree-icon">{isFolder ? (isExpanded ? "v" : ">") : "-"}</span>
+            <span className="note-tree-name">{noteLabel(item)}</span>
+          </button>
+          {isFolder && isExpanded ? renderTreeNodes(item.id, depth + 1) : null}
+        </div>
+      );
+    });
+  }
+
+  useEffect(() => {
     if (typeof window === "undefined") return;
     window.localStorage.setItem("app_theme", theme);
   }, [theme]);
@@ -723,7 +1152,7 @@ export default function App() {
         (formatterNode.output && Object.keys(formatterNode.output).length > 0));
     if (formatterNode?.id && hasFormatterOutput) {
       setSelectedNodeId(formatterNode.id);
-      setViewMode("rendered");
+      setViewMode("preview");
       setInspectorExpanded(true);
       autoFocusedFormatterRunRef.current.add(runDetail.run_id);
     }
@@ -942,7 +1371,25 @@ export default function App() {
         </div>
       </header>
 
-      <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""}`}>
+      <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""} ${activeSection === "notes" ? "notes-mode" : ""}`}>
+        <aside className="left-nav-rail">
+          <button
+            className={`rail-icon-btn ${activeSection === "run" ? "active" : ""}`}
+            onClick={() => setActiveSection("run")}
+            title="Agent Run"
+          >
+            ▶
+          </button>
+          <button
+            className={`rail-icon-btn ${activeSection === "notes" ? "active" : ""}`}
+            onClick={() => setActiveSection("notes")}
+            title="Notes"
+          >
+            📝
+          </button>
+        </aside>
+        {activeSection === "run" ? (
+        <>
         <aside className="left-panel">
         <div className="left-panel-header">
           <h2>Runs</h2>
@@ -1120,29 +1567,39 @@ export default function App() {
           </div>
           {runDetail ? (
             <>
-              <div className="run-header">
-                <div>
-                  <strong>Run:</strong> #{runDetail.run_id}
-                </div>
-                <div>
-                  <strong>Status:</strong> {runDetail.status}
-                </div>
-              </div>
-              <div className="node-meta">
-                <div>
-                  <strong>Node:</strong> {selectedNode?.id ?? "-"}
-                </div>
-                <div>
-                  <strong>Agent:</strong> {selectedNode?.agent ?? "-"}
-                </div>
-                <div>
-                  <strong>Reads:</strong> {(selectedNode?.reads ?? []).join(", ") || "-"}
-                </div>
-                <div>
-                  <strong>Writes:</strong> {(selectedNode?.writes ?? []).join(", ") || "-"}
-                </div>
-              </div>
+              {viewMode !== "preview" ? (
+                <>
+                  <div className="run-header">
+                    <div>
+                      <strong>Run:</strong> #{runDetail.run_id}
+                    </div>
+                    <div>
+                      <strong>Status:</strong> {runDetail.status}
+                    </div>
+                  </div>
+                  <div className="node-meta">
+                    <div>
+                      <strong>Node:</strong> {selectedNode?.id ?? "-"}
+                    </div>
+                    <div>
+                      <strong>Agent:</strong> {selectedNode?.agent ?? "-"}
+                    </div>
+                    <div>
+                      <strong>Reads:</strong> {(selectedNode?.reads ?? []).join(", ") || "-"}
+                    </div>
+                    <div>
+                      <strong>Writes:</strong> {(selectedNode?.writes ?? []).join(", ") || "-"}
+                    </div>
+                  </div>
+                </>
+              ) : null}
               <div className="output-tabs">
+                <button
+                  className={viewMode === "preview" ? "active-tab" : ""}
+                  onClick={() => setViewMode("preview")}
+                >
+                  Preview
+                </button>
                 <button
                   className={viewMode === "rendered" ? "active-tab" : ""}
                   onClick={() => setViewMode("rendered")}
@@ -1157,20 +1614,194 @@ export default function App() {
                 </button>
               </div>
               <div className="markdown-view">
-                {viewMode === "rendered" ? (
+                {viewMode === "json" ? (
+                  <pre>{JSON.stringify(selectedNode?.output ?? {}, null, 2)}</pre>
+                ) : (
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>
                     {renderNodeOutput(selectedNode)}
                   </ReactMarkdown>
-                ) : (
-                  <pre>{JSON.stringify(selectedNode?.output ?? {}, null, 2)}</pre>
                 )}
               </div>
+              {(selectedNode?.agent || "").toLowerCase().includes("formatter") ? (
+                <div className="clarification-actions">
+                  <textarea
+                    rows={3}
+                    value={formatterFollowupPrompt}
+                    onChange={(e) => setFormatterFollowupPrompt(e.target.value)}
+                    placeholder="Ask more about this formatter answer..."
+                  />
+                  <button
+                    onClick={submitFormatterFollowup}
+                    disabled={formatterFollowupSubmitting || !formatterFollowupPrompt.trim()}
+                  >
+                    {formatterFollowupSubmitting ? "Submitting..." : "Ask More"}
+                  </button>
+                </div>
+              ) : null}
             </>
           ) : (
             <div className="empty">Select a run to view details.</div>
           )}
           {error ? <div className="error-box">{error}</div> : null}
         </aside>
+        </>
+        ) : (
+          <main className="notes-panel">
+            <div className="notes-menubar">
+              <span>File</span>
+              <span>Edit</span>
+              <span>Selection</span>
+              <span>View</span>
+              <span>Help</span>
+            </div>
+            <div className="notes-layout">
+              <aside className="notes-sidebar">
+                <div className="notes-sidebar-title">
+                  <span>Files</span>
+                  <div className="notes-sidebar-icons">
+                    <button
+                      className="icon-btn"
+                      title="New file"
+                      onClick={() => beginInlineCreate("file")}
+                      disabled={savingNote}
+                    >
+                      <svg className="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M8 4h6l4 4v12H8z" fill="none" stroke="currentColor" strokeWidth="1.8" />
+                        <path d="M14 4v4h4" fill="none" stroke="currentColor" strokeWidth="1.8" />
+                        <path d="M12 13v6M9 16h6" fill="none" stroke="currentColor" strokeWidth="1.8" />
+                      </svg>
+                    </button>
+                    <button
+                      className="icon-btn"
+                      title="New folder"
+                      onClick={() => beginInlineCreate("folder")}
+                      disabled={savingNote}
+                    >
+                      <svg className="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M3 8h7l2 2h9v10H3z" fill="none" stroke="currentColor" strokeWidth="1.8" />
+                        <path d="M12 12v6M9 15h6" fill="none" stroke="currentColor" strokeWidth="1.8" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+                <div className="notes-tree">
+                  {notesLoading ? <div className="empty">Loading files...</div> : null}
+                  {!notesLoading && notes.length === 0 ? <div className="empty">Create your first file.</div> : null}
+                  {creatingNodeType ? (
+                    <div className="inline-create-row">
+                      <span className="note-tree-icon">{creatingNodeType === "folder" ? ">" : "-"}</span>
+                      <input
+                        autoFocus
+                        value={creatingNodeName}
+                        onChange={(e) => setCreatingNodeName(e.target.value)}
+                        placeholder={creatingNodeType === "folder" ? "folder name" : "file name (.md auto)"}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") submitInlineCreate();
+                          if (e.key === "Escape") cancelInlineCreate();
+                        }}
+                        onBlur={() => {
+                          if (creatingNodeName.trim()) {
+                            submitInlineCreate();
+                          } else {
+                            cancelInlineCreate();
+                          }
+                        }}
+                      />
+                    </div>
+                  ) : null}
+                  {!notesLoading ? renderTreeNodes() : null}
+                </div>
+              </aside>
+              <section className="note-editor-pane">
+                <div className="notes-toolbar editor-tools">
+                  <select value={editorFont} onChange={(e) => setEditorFont(e.target.value)}>
+                    <option value="Consolas">Consolas</option>
+                    <option value="Arial">Arial</option>
+                    <option value="Georgia">Georgia</option>
+                  </select>
+                  <select value={editorFontSize} onChange={(e) => setEditorFontSize(e.target.value)}>
+                    <option value="12">12</option>
+                    <option value="14">14</option>
+                    <option value="16">16</option>
+                    <option value="18">18</option>
+                  </select>
+                  <button onClick={() => execEditorCommand("bold")} disabled={!activeNoteTabId}>B</button>
+                  <button onClick={() => execEditorCommand("italic")} disabled={!activeNoteTabId}>I</button>
+                  <button onClick={() => execEditorCommand("underline")} disabled={!activeNoteTabId}>U</button>
+                  <input
+                    type="color"
+                    className="color-input"
+                    onChange={(e) => execEditorCommand("foreColor", e.target.value)}
+                    disabled={!activeNoteTabId}
+                  />
+                  <button
+                    onClick={() => {
+                      const href = window.prompt("Enter URL");
+                      if (href) execEditorCommand("createLink", href);
+                    }}
+                    disabled={!activeNoteTabId}
+                  >
+                    Link
+                  </button>
+                  <button onClick={() => activeNoteTabId && removeNote(activeNoteTabId)} disabled={!activeNoteTabId}>
+                    Delete
+                  </button>
+                </div>
+                <div className="notes-tabs">
+                  {openTabNotes.map((tab) => (
+                    <button
+                      key={tab.id}
+                      className={`note-tab ${activeNoteTabId === tab.id ? "active" : ""}`}
+                      onClick={() => {
+                        setActiveNoteTabId(tab.id);
+                        setSelectedNoteId(tab.id);
+                      }}
+                    >
+                      <span>{noteLabel(tab)}</span>
+                      <span
+                        className="tab-close"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          closeTab(tab.id);
+                        }}
+                      >
+                        x
+                      </span>
+                    </button>
+                  ))}
+                </div>
+                {selectedNote ? (
+                  <>
+                    <div className="note-editor-header">
+                      <div className="note-filename">{noteLabel(selectedNote)}</div>
+                      <div className="note-filemeta">
+                        {noteSaving
+                          ? "Auto-saving..."
+                          : new Date(selectedNote.updated_at || selectedNote.created_at).toLocaleString()}
+                      </div>
+                    </div>
+                    <div
+                      ref={noteEditorRef}
+                      className="note-editor-textarea"
+                      contentEditable
+                      suppressContentEditableWarning
+                      style={{ fontFamily: editorFont, fontSize: `${editorFontSize}px` }}
+                      onInput={(e) => setNoteEditorContent(e.currentTarget.innerHTML)}
+                    />
+                  </>
+                ) : (
+                  <div className="empty">Open a file from the left tree to start editing.</div>
+                )}
+              </section>
+            </div>
+            <div className="notes-statusbar">
+              <span>{selectedNote ? noteLabel(selectedNote) : "No file selected"}</span>
+              <span>
+                Words: {noteStats.words} | Chars: {noteStats.chars}
+              </span>
+            </div>
+          </main>
+        )}
       </div>
     </div>
   );
