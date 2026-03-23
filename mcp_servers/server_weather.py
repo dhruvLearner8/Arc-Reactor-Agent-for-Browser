@@ -51,19 +51,40 @@ async def get_current_weather(city_or_place: str) -> str:
 
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
-            geo_r = await client.get(
-                "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": place, "count": "3", "language": "en", "format": "json"},
-            )
-            geo_r.raise_for_status()
-            geo = geo_r.json()
-            results = geo.get("results") or []
+            # Open-Meteo geocoding can miss longer comma-separated inputs.
+            # Retry with progressively simplified names before failing.
+            candidates = [place]
+            parts = [p.strip() for p in place.split(",") if p.strip()]
+            if parts:
+                city = parts[0]
+                if city not in candidates:
+                    candidates.append(city)
+                if len(parts) >= 2:
+                    city_region = f"{city} {parts[1]}"
+                    if city_region not in candidates:
+                        candidates.append(city_region)
+
+            results = []
+            resolved_query = place
+            for candidate in candidates:
+                geo_r = await client.get(
+                    "https://geocoding-api.open-meteo.com/v1/search",
+                    params={"name": candidate, "count": "3", "language": "en", "format": "json"},
+                )
+                geo_r.raise_for_status()
+                geo = geo_r.json()
+                results = geo.get("results") or []
+                if results:
+                    resolved_query = candidate
+                    break
+
             if not results:
                 return json.dumps(
                     {
                         "error": "geocode_not_found",
                         "query": place,
-                        "message": "No location match. Try a larger city or add country (e.g. Paris France).",
+                        "attempted_queries": candidates,
+                        "message": "No location match after fallback retries.",
                     }
                 )
 
@@ -114,6 +135,7 @@ async def get_current_weather(city_or_place: str) -> str:
                 "surface_pressure_hpa": cur.get("surface_pressure"),
                 "conditions": conditions,
                 "weather_code": code_i,
+                "resolved_query": resolved_query,
                 "data_source": "Open-Meteo (https://open-meteo.com)",
             }
             return json.dumps(out, indent=2)

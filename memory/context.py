@@ -485,13 +485,38 @@ class ExecutionContextManager:
                 
                 # Strategy 2: Extract from direct agent output (ThinkerAgent, DistillerAgent, FormatterAgent)
                 if not extracted and output and isinstance(output, dict):
+                    # Prefer explicit execution_result payload when available.
+                    # Some agents prefill writes with {} placeholders, while the
+                    # executed tool result is stored under execution_result.
+                    exec_payload = output.get("execution_result")
+                    if isinstance(exec_payload, dict) and write_key in exec_payload:
+                        exec_val = self._ensure_parsed_value(exec_payload[write_key])
+                        if exec_val not in (None, "", [], {}):
+                            globals_schema[write_key] = exec_val
+                            print(f"✅ Extracted {write_key} = {exec_payload[write_key]} (execution_result)")
+                            extracted = True
+
                     # Check root
-                    if write_key in output:
-                        globals_schema[write_key] = self._ensure_parsed_value(output[write_key])
-                        print(f"✅ Extracted {write_key} = {output[write_key]} (direct)")
-                        extracted = True
+                    if not extracted and write_key in output:
+                        direct_val = self._ensure_parsed_value(output[write_key])
+                        # Do not lock-in empty placeholders if execution_result exists.
+                        if (
+                            direct_val in (None, "", [], {})
+                            and isinstance(output.get("execution_result"), dict)
+                            and write_key in output.get("execution_result", {})
+                        ):
+                            pass
+                        else:
+                            globals_schema[write_key] = direct_val
+                            print(f"✅ Extracted {write_key} = {output[write_key]} (direct)")
+                            extracted = True
                     # Check nested 'output' dictionary (common pattern)
-                    elif "output" in output and isinstance(output["output"], dict) and write_key in output["output"]:
+                    elif (
+                        not extracted
+                        and "output" in output
+                        and isinstance(output["output"], dict)
+                        and write_key in output["output"]
+                    ):
                         val = output["output"][write_key]
                         globals_schema[write_key] = self._ensure_parsed_value(val)
                         print(f"✅ Extracted {write_key} = {val} (nested)")
