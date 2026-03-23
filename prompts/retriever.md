@@ -14,6 +14,7 @@ Return **strict JSON** (no prose) and always use the exact variable names from `
 5. Return raw evidence; do not summarize.
 
 ## Available Research Tools
+- **`get_current_weather(city_or_place)`** -> **live JSON** (temp °C, humidity, wind, conditions). **Use first** for any weather / temperature / “what’s it like outside” query — no scraping.
 - `web_search(query, count)` -> URL list (stringified JSON)
 - `fetch_search_urls(query, count)` -> URL list (stringified JSON)
 - `web_extract_text(url)` -> extracted text

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactFlow, {
   Background,
   Controls,
@@ -7,6 +7,7 @@ import ReactFlow, {
   MiniMap,
   Position,
 } from "reactflow";
+import DOMPurify from "dompurify";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import TurndownService from "turndown";
@@ -26,6 +27,58 @@ const SAMPLE_QUERIES = [
   "Plan a USA road trip from Canada with 3 friends under CAD 3,000 per person, including route, stays, activities, and budget split.",
   "What should I buy in 2026: gold or stocks? Do detailed research with macro trends, risks, scenarios, and a practical recommendation.",
 ];
+
+function FormattedMailBody({ text }) {
+  if (!text || typeof text !== "string") return null;
+  const trimmed = text.trim();
+  const looksLikeHtml = /^\s*</.test(trimmed) || /<html[\s>]/i.test(trimmed) || /<body[\s>]/i.test(trimmed) || /<div[\s>]/i.test(trimmed);
+  if (looksLikeHtml) {
+    const sanitized = DOMPurify.sanitize(text, {
+      ALLOWED_TAGS: ["p", "br", "strong", "b", "em", "i", "u", "a", "ul", "ol", "li", "h1", "h2", "h3", "h4", "div", "span", "table", "tr", "td", "th", "tbody", "thead", "img"],
+      ALLOWED_ATTR: ["href", "src", "alt", "title", "style", "class"],
+    });
+    return (
+      <div
+        className="formatted-mail-body mail-html-body"
+        dangerouslySetInnerHTML={{ __html: sanitized }}
+      />
+    );
+  }
+  const normalized = text.replace(/\\n/g, "\n");
+  const lines = normalized.split(/\r?\n/);
+  const isQuotedLine = (ln) => /^[\s>]*>/.test(ln) || /^On .+ wrote:?\s*$/i.test(ln.trim());
+  const blocks = [];
+  let i = 0;
+  while (i < lines.length) {
+    const quoted = [];
+    while (i < lines.length && isQuotedLine(lines[i])) {
+      quoted.push(lines[i]);
+      i++;
+    }
+    if (quoted.length) blocks.push({ type: "quote", lines: quoted });
+    const plain = [];
+    while (i < lines.length && !isQuotedLine(lines[i])) {
+      plain.push(lines[i]);
+      i++;
+    }
+    if (plain.length) blocks.push({ type: "plain", lines: plain });
+  }
+  return (
+    <div className="formatted-mail-body">
+      {blocks.map((block, idx) =>
+        block.type === "quote" ? (
+          <blockquote key={idx} className="mail-quoted-block">
+            {block.lines.join("\n")}
+          </blockquote>
+        ) : (
+          <div key={idx} className="mail-plain-block" style={{ whiteSpace: "pre-wrap" }}>
+            {block.lines.join("\n")}
+          </div>
+        )
+      )}
+    </div>
+  );
+}
 
 function statusSubtitle(node) {
   const agent = (node.agent || "").toLowerCase();
@@ -493,6 +546,17 @@ export default function App() {
   const [expandedFolders, setExpandedFolders] = useState({});
   const [editorFont, setEditorFont] = useState("Consolas");
   const [editorFontSize, setEditorFontSize] = useState("14");
+  const [mailThreads, setMailThreads] = useState([]);
+  const [selectedThreadId, setSelectedThreadId] = useState("");
+  const [mailReplyBody, setMailReplyBody] = useState("");
+  const [mailLoading, setMailLoading] = useState(false);
+  const [mailSending, setMailSending] = useState(false);
+  const [mailDraftLoading, setMailDraftLoading] = useState(false);
+  const [mailFilter, setMailFilter] = useState("all"); // "all" | "priority"
+  const [mailError, setMailError] = useState("");
+  const [mailCurrentPage, setMailCurrentPage] = useState(1);
+  const [mailPageTokens, setMailPageTokens] = useState({}); // { 2: token, 3: token, ... } token to fetch that page
+  const [mailNextPageToken, setMailNextPageToken] = useState(null); // from last response, for Next
   const noteEditorRef = useRef(null);
   const lastSavedContentByIdRef = useRef({});
   const inlineCreateSubmittingRef = useRef(false);
@@ -939,6 +1003,95 @@ export default function App() {
     }
   }
 
+  async function fetchMailMessages(pageToken = null, pageNum = 1) {
+    if (!accessToken) return;
+    setMailLoading(true);
+    setMailError("");
+    try {
+      const q = mailFilter === "priority" ? "is:important" : "";
+      let url = `/api/mail/messages?max_results=20${q ? `&q=${encodeURIComponent(q)}` : ""}`;
+      if (pageToken) url += `&page_token=${encodeURIComponent(pageToken)}`;
+      const res = await fetch(apiUrl(url), { headers: getAuthHeaders() });
+      if (res.status === 503) {
+        const detail = await readErrorMessage(res, "Gmail not configured");
+        setMailError(detail);
+        setMailMessages([]);
+        return;
+      }
+      if (!res.ok) throw new Error(await readErrorMessage(res, "Failed to load mail"));
+      const data = await res.json();
+      const arr = Array.isArray(data?.threads) ? data.threads : [];
+      const nextTok = data?.nextPageToken ?? null;
+      setMailThreads(arr);
+      setMailCurrentPage(pageNum);
+      setMailNextPageToken(nextTok);
+      if (nextTok) {
+        setMailPageTokens((prev) => ({ ...prev, [pageNum + 1]: nextTok }));
+      }
+      const ids = new Set(arr.map((t) => t.id));
+      setSelectedThreadId((prev) => {
+        if (ids.has(prev)) return prev;
+        return arr[0]?.id ?? "";
+      });
+    } catch (e) {
+      setMailError(String(e));
+      setMailThreads([]);
+    } finally {
+      setMailLoading(false);
+    }
+  }
+
+  function goToMailPage(dir) {
+    if (dir === "next" && mailNextPageToken) {
+      const token = mailPageTokens[mailCurrentPage + 1] ?? mailNextPageToken;
+      fetchMailMessages(token, mailCurrentPage + 1);
+    } else if (dir === "prev" && mailCurrentPage > 1) {
+      const token = mailCurrentPage === 2 ? null : mailPageTokens[mailCurrentPage - 1];
+      fetchMailMessages(token || null, mailCurrentPage - 1);
+    }
+  }
+
+
+  async function sendMailReply() {
+    if (!replyToMessageId || !mailReplyBody.trim() || !accessToken) return;
+    setMailSending(true);
+    setMailError("");
+    try {
+      const res = await fetch(apiUrl("/api/mail/reply"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({ message_id: replyToMessageId, body: mailReplyBody.trim() }),
+      });
+      if (!res.ok) throw new Error(await readErrorMessage(res, "Failed to send reply"));
+      setMailReplyBody("");
+      await fetchMailMessages();
+    } catch (e) {
+      setMailError(String(e));
+    } finally {
+      setMailSending(false);
+    }
+  }
+
+  async function draftMailWithAi() {
+    if (!replyToMessageId || !accessToken) return;
+    setMailDraftLoading(true);
+    setMailError("");
+    try {
+      const res = await fetch(apiUrl("/api/mail/draft-with-ai"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({ message_id: replyToMessageId }),
+      });
+      if (!res.ok) throw new Error(await readErrorMessage(res, "Failed to generate draft"));
+      const data = await res.json();
+      setMailReplyBody(data?.draft ?? "");
+    } catch (e) {
+      setMailError(String(e));
+    } finally {
+      setMailDraftLoading(false);
+    }
+  }
+
   async function removeNote(noteId) {
     if (!accessToken) return;
     try {
@@ -1013,12 +1166,31 @@ export default function App() {
   }, [accessToken, authLoading]);
 
   useEffect(() => {
-    if (!selectedNote) {
+    if (activeSection === "mail" && accessToken) {
+      setMailPageTokens({});
+      setMailCurrentPage(1);
+      fetchMailMessages(null, 1);
+    }
+  }, [activeSection, accessToken, mailFilter]);
+
+
+  const lastEditorTabIdRef = useRef("");
+  useEffect(() => {
+    if (!activeNoteTabId) {
       setNoteEditorContent("");
+      lastEditorTabIdRef.current = "";
       return;
     }
-    setNoteEditorContent(selectedNote.content || "");
-  }, [selectedNote]);
+    const note = notes.find((n) => n.id === activeNoteTabId && n.kind !== "folder");
+    if (!note) return;
+    if (lastEditorTabIdRef.current === activeNoteTabId) {
+      return;
+    }
+    lastEditorTabIdRef.current = activeNoteTabId;
+    const html = String(note.content || "");
+    setNoteEditorContent(html);
+    lastSavedContentByIdRef.current[activeNoteTabId] = html;
+  }, [activeNoteTabId, notes]);
 
   useEffect(() => {
     if (!accessToken || !activeNoteTabId || !selectedNote || selectedNote.kind === "folder") return;
@@ -1048,6 +1220,28 @@ export default function App() {
     setActiveNoteTabId(firstFile?.id || "");
   }, [notes, activeNoteTabId, openNoteTabs]);
 
+  function mailFromLabel(fromStr) {
+    if (!fromStr) return "(unknown)";
+    const match = fromStr.match(/^([^<]+)<[^>]+>$/);
+    return match ? match[1].trim() : fromStr;
+  }
+
+  function mailDateLabel(dateStr) {
+    if (!dateStr) return "";
+    try {
+      const d = new Date(dateStr);
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const diffDays = Math.floor((today - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 86400000);
+      if (diffDays === 0) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      if (diffDays === 1) return "Yesterday";
+      if (diffDays < 7) return d.toLocaleDateString([], { weekday: "short" });
+      return d.toLocaleDateString([], { month: "short", day: "numeric" });
+    } catch {
+      return dateStr;
+    }
+  }
+
   const noteLabel = (note) => {
     const safeId = String(note?.id || "").replace(/^note_/, "").slice(0, 8) || "file";
     const rawName = String(note?.name || "").trim().replace(/[\\/:*?"<>|]+/g, "");
@@ -1067,12 +1261,35 @@ export default function App() {
     [openNoteTabs, notes]
   );
 
-  useEffect(() => {
-    if (!noteEditorRef.current) return;
-    if (noteEditorRef.current.innerHTML !== (noteEditorContent || "")) {
-      noteEditorRef.current.innerHTML = noteEditorContent || "";
+  const selectedThread = useMemo(
+    () => mailThreads.find((t) => t.id === selectedThreadId) ?? null,
+    [mailThreads, selectedThreadId]
+  );
+  const replyToMessageId = useMemo(
+    () => {
+      const msgs = selectedThread?.messages ?? [];
+      return msgs.length > 0 ? msgs[msgs.length - 1].id : "";
+    },
+    [selectedThread]
+  );
+
+  const lastDomSyncedTabRef = useRef("");
+  useLayoutEffect(() => {
+    const el = noteEditorRef.current;
+    if (!el) return;
+    if (!activeNoteTabId) {
+      el.innerHTML = "";
+      lastDomSyncedTabRef.current = "";
+      return;
     }
-  }, [noteEditorContent, activeNoteTabId]);
+    const note = notes.find((n) => n.id === activeNoteTabId && n.kind !== "folder");
+    if (!note) return;
+    if (lastDomSyncedTabRef.current === activeNoteTabId) {
+      return;
+    }
+    lastDomSyncedTabRef.current = activeNoteTabId;
+    el.innerHTML = String(note.content || "");
+  }, [activeNoteTabId, notes]);
 
   function closeTab(noteId) {
     setOpenNoteTabs((prev) => {
@@ -1371,7 +1588,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""} ${activeSection === "notes" ? "notes-mode" : ""}`}>
+      <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""} ${activeSection === "notes" ? "notes-mode" : ""} ${activeSection === "mail" ? "mail-mode" : ""}`}>
         <aside className="left-nav-rail">
           <button
             className={`rail-icon-btn ${activeSection === "run" ? "active" : ""}`}
@@ -1383,9 +1600,16 @@ export default function App() {
           <button
             className={`rail-icon-btn ${activeSection === "notes" ? "active" : ""}`}
             onClick={() => setActiveSection("notes")}
-            title="Notes"
+            title="Notepad"
           >
             📝
+          </button>
+          <button
+            className={`rail-icon-btn ${activeSection === "mail" ? "active" : ""}`}
+            onClick={() => setActiveSection("mail")}
+            title="Mail"
+          >
+            ✉
           </button>
         </aside>
         {activeSection === "run" ? (
@@ -1645,6 +1869,182 @@ export default function App() {
           {error ? <div className="error-box">{error}</div> : null}
         </aside>
         </>
+        ) : activeSection === "mail" ? (
+          <main className="mail-panel-full">
+            <div className="mail-panel-header-bar">
+              <span className="mail-panel-title">Mail</span>
+              <div className="mail-filter-tabs">
+                <button
+                  className={`mail-filter-tab ${mailFilter === "all" ? "active" : ""}`}
+                  onClick={() => setMailFilter("all")}
+                  type="button"
+                >
+                  All
+                </button>
+                <button
+                  className={`mail-filter-tab ${mailFilter === "priority" ? "active" : ""}`}
+                  onClick={() => setMailFilter("priority")}
+                  type="button"
+                >
+                  Priority
+                </button>
+              </div>
+              <div className="mail-pagination">
+                <button
+                  className="mail-page-btn"
+                  onClick={() => goToMailPage("prev")}
+                  disabled={mailLoading || mailCurrentPage <= 1}
+                  type="button"
+                >
+                  ‹ Prev
+                </button>
+                <span className="mail-page-num">Page {mailCurrentPage}</span>
+                <button
+                  className="mail-page-btn"
+                  onClick={() => goToMailPage("next")}
+                  disabled={mailLoading || !mailNextPageToken}
+                  type="button"
+                >
+                  Next ›
+                </button>
+              </div>
+              <button
+                className="mail-refresh-btn"
+                onClick={() => fetchMailMessages(mailCurrentPage === 1 ? null : mailPageTokens[mailCurrentPage], mailCurrentPage)}
+                disabled={mailLoading}
+                type="button"
+              >
+                {mailLoading ? "Loading..." : "Refresh"}
+              </button>
+            </div>
+            <div className="mail-panel-content">
+              {mailError ? <div className="mail-error">{mailError}</div> : null}
+              <div className="mail-layout">
+                <div className="mail-list-wrapper">
+                  <div className="mail-list">
+                    {mailLoading ? (
+                      <>
+                        {[1, 2, 3, 4, 5].map((i) => (
+                          <div key={i} className="mail-list-item mail-skeleton">
+                            <div className="mail-skeleton-line short" />
+                            <div className="mail-skeleton-line" />
+                            <div className="mail-skeleton-line long" />
+                          </div>
+                        ))}
+                      </>
+                    ) : (
+                    <>
+                      {mailThreads.map((thread) => {
+                        const latest = thread.messages?.[thread.messages.length - 1];
+                        const m = latest || {};
+                        return (
+                          <button
+                            key={thread.id}
+                            className={`mail-list-item ${selectedThreadId === thread.id ? "active" : ""}`}
+                            onClick={() => setSelectedThreadId(thread.id)}
+                            type="button"
+                          >
+                            <div className="mail-item-row">
+                              <span className="mail-item-from">{mailFromLabel(m.from)}</span>
+                              <span className="mail-item-date">{mailDateLabel(m.date)}</span>
+                            </div>
+                            <span className="mail-item-subject">{m.subject || "(no subject)"}</span>
+                            <span className="mail-item-snippet">{thread.snippet || m.snippet || ""}</span>
+                            {thread.messages?.length > 1 ? (
+                              <span className="mail-item-thread-count">{thread.messages.length} messages</span>
+                            ) : null}
+                          </button>
+                        );
+                      })}
+                      {mailThreads.length === 0 && !mailError ? (
+                          <div className="mail-empty">
+                            {mailFilter === "priority" ? "No priority emails." : "No messages."}
+                          </div>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                  {!mailLoading && (mailCurrentPage > 1 || mailNextPageToken) ? (
+                    <div className="mail-list-pagination">
+                      <button
+                        className="mail-list-page-btn"
+                        onClick={() => goToMailPage("prev")}
+                        disabled={mailCurrentPage <= 1}
+                        type="button"
+                      >
+                        ‹ Previous page
+                      </button>
+                      <span className="mail-list-page-info">Page {mailCurrentPage}</span>
+                      <button
+                        className="mail-list-page-btn"
+                        onClick={() => goToMailPage("next")}
+                        disabled={!mailNextPageToken}
+                        type="button"
+                      >
+                        Next page ›
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="mail-detail-area">
+                  {selectedThread ? (
+                    <>
+                      <div className="mail-thread-header">
+                        <div className="mail-detail-subject">{selectedThread.messages?.[0]?.subject || "(no subject)"}</div>
+                      </div>
+                      <div className="mail-thread-messages">
+                        {(selectedThread.messages || []).map((msg) => (
+                          <div key={msg.id} className="mail-thread-message">
+                            <div className="mail-detail-from">
+                              <span className="mail-detail-avatar">{mailFromLabel(msg.from).charAt(0).toUpperCase()}</span>
+                              <div>
+                                <div className="mail-detail-from-name">{mailFromLabel(msg.from)}</div>
+                                <div className="mail-detail-date">{msg.date}</div>
+                              </div>
+                            </div>
+                            <div className="mail-detail-body mail-body-formatted">
+                              {msg.body ? (
+                                <FormattedMailBody text={msg.body} />
+                              ) : (
+                                <span>{msg.snippet || "(no body)"}</span>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mail-reply-box">
+                        <textarea
+                          rows={4}
+                          value={mailReplyBody}
+                          onChange={(e) => setMailReplyBody(e.target.value)}
+                          placeholder="Type your reply..."
+                          className="mail-reply-textarea"
+                        />
+                        <div className="mail-reply-actions">
+                          <button
+                            onClick={draftMailWithAi}
+                            disabled={mailDraftLoading}
+                            type="button"
+                          >
+                            {mailDraftLoading ? "Generating..." : "Write by AI"}
+                          </button>
+                          <button
+                            onClick={sendMailReply}
+                            disabled={mailSending || !mailReplyBody.trim()}
+                            type="button"
+                          >
+                            {mailSending ? "Sending..." : "Send"}
+                          </button>
+                        </div>
+                      </div>
+                    </>
+                    ) : (
+                    <div className="mail-empty mail-empty-detail">Select a thread to view and reply.</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </main>
         ) : (
           <main className="notes-panel">
             <div className="notes-menubar">

@@ -60,6 +60,21 @@ class RunCreateResponse(BaseModel):
     summary: dict[str, Any] = {}
 
 
+class MailSendRequest(BaseModel):
+    to: str = Field(min_length=1)
+    subject: str = Field(default="")
+    body: str = Field(default="")
+
+
+class MailReplyRequest(BaseModel):
+    message_id: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+
+
+class MailDraftRequest(BaseModel):
+    message_id: str = Field(min_length=1)
+
+
 app = FastAPI(title="S15 NewArch API", version="0.1.0")
 
 cors_origins_env = os.getenv("CORS_ORIGINS", "")
@@ -1162,6 +1177,140 @@ async def delete_note(note_id: str, current_user: AuthUser = Depends(get_current
     filtered = [n for n in notes if n.get("id") not in to_delete]
     _save_notes(current_user.user_id, filtered)
     return {"status": "deleted", "id": note_id, "deleted_count": len(to_delete)}
+
+
+# ----- Mail (Gmail) API - separate from Arc Reactor agents -----
+def _gmail_available() -> bool:
+    tok = BASE_DIR / "token.json"
+    creds = BASE_DIR / "credentials.json"
+    return creds.exists() and (tok.exists() or True)
+
+
+@app.get("/api/mail/messages")
+async def mail_list(
+    max_results: int = 20,
+    q: str = "",
+    page_token: str | None = None,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """List Gmail threads (conversations) with pagination. Returns {threads, nextPageToken}."""
+    if not _gmail_available():
+        raise HTTPException(status_code=503, detail="Gmail not configured. Add credentials.json and run generate_gmail_token.py")
+    try:
+        from lib.gmail_api import get_gmail_service, list_threads
+        service = get_gmail_service()
+        threads, next_tok = await asyncio.to_thread(
+            list_threads,
+            service,
+            max_results=min(max_results, 50),
+            query=q,
+            page_token=page_token,
+        )
+        return {"threads": threads, "nextPageToken": next_tok}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/mail/messages/{message_id}")
+async def mail_get(
+    message_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Get full email by ID."""
+    if not _gmail_available():
+        raise HTTPException(status_code=503, detail="Gmail not configured")
+    try:
+        from lib.gmail_api import get_gmail_service, get_message
+        service = get_gmail_service()
+        msg = await asyncio.to_thread(get_message, service, message_id)
+        return msg
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mail/send")
+async def mail_send(
+    req: MailSendRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Send a new email."""
+    if not _gmail_available():
+        raise HTTPException(status_code=503, detail="Gmail not configured")
+    try:
+        from lib.gmail_api import get_gmail_service, send_message
+        service = get_gmail_service()
+        sent = await asyncio.to_thread(send_message, service, to=req.to, subject=req.subject, body=req.body)
+        return {"status": "sent", "id": sent.get("id")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mail/reply")
+async def mail_reply(
+    req: MailReplyRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Reply to an existing email."""
+    if not _gmail_available():
+        raise HTTPException(status_code=503, detail="Gmail not configured")
+    try:
+        from lib.gmail_api import get_gmail_service, reply_to_message
+        service = get_gmail_service()
+        sent = await asyncio.to_thread(reply_to_message, service, original_id=req.message_id, body=req.body)
+        return {"status": "sent", "id": sent.get("id")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mail/draft-with-ai")
+async def mail_draft_with_ai(
+    req: MailDraftRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Generate an AI draft reply for an email. Returns { draft: string }."""
+    if not _gmail_available():
+        raise HTTPException(status_code=503, detail="Gmail not configured")
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY required for AI draft")
+    try:
+        from lib.gmail_api import get_gmail_service, get_message
+        from google import genai
+        service = get_gmail_service()
+        msg = await asyncio.to_thread(get_message, service, req.message_id)
+        from_addr = msg.get("from", "")
+        subject = msg.get("subject", "")
+        body = (msg.get("body") or "")[:8000]
+        prompt = f"""You are helping reply to an email. Write a concise, professional reply.
+
+From: {from_addr}
+Subject: {subject}
+
+Email body:
+---
+{body}
+---
+
+Write only the reply body (plain text, no subject/headers). Keep it brief and actionable. Sign off appropriately if it's to a client or colleague."""
+        client = genai.Client(api_key=api_key)
+        response = await asyncio.to_thread(
+            lambda: client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+        )
+        draft = (getattr(response, "text", None) or "").strip()
+        if not draft and response and getattr(response, "candidates", None):
+            for c in response.candidates or []:
+                if getattr(c, "content", None) and getattr(c.content, "parts", None):
+                    for p in c.content.parts or []:
+                        if getattr(p, "text", None):
+                            draft = (p.text or "").strip()
+                            break
+                    if draft:
+                        break
+        return {"draft": draft}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/admin/logs")

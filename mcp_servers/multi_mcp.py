@@ -27,7 +27,11 @@ class MultiMCP:
             "sandbox": {
                 "command": "uv",
                 "args": ["run", "mcp_servers/server_sandbox.py"],
-            }
+            },
+            "weather": {
+                "command": "uv",
+                "args": ["run", "mcp_servers/server_weather.py"],
+            },
         }
 
     async def start(self):
