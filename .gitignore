@@ -78,4 +78,7 @@ token.json
 # Local run / note stores
 memory/local_runs/
 memory/notes/
+memory/guest_usage.json
+memory/gmail_users/
+memory/scheduled_jobs/
 

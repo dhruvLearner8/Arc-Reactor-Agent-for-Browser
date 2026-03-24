@@ -618,6 +618,9 @@ export default function App() {
   const [mailDraftLoading, setMailDraftLoading] = useState(false);
   const [mailFilter, setMailFilter] = useState("all"); // "all" | "priority"
   const [mailError, setMailError] = useState("");
+  const [mailGmailStatus, setMailGmailStatus] = useState(null);
+  const [mailStatusLoading, setMailStatusLoading] = useState(false);
+  const [mailOAuthBusy, setMailOAuthBusy] = useState(false);
   const [mailCurrentPage, setMailCurrentPage] = useState(1);
   const [mailPageTokens, setMailPageTokens] = useState({}); // { 2: token, 3: token, ... } token to fetch that page
   const [mailNextPageToken, setMailNextPageToken] = useState(null); // from last response, for Next
@@ -643,7 +646,12 @@ export default function App() {
   const inlineCreateSubmittingRef = useRef(false);
   const autoFocusedFormatterRunRef = useRef(new Set());
   const clarificationPanelRef = useRef(null);
-  const accessToken = session?.access_token ?? "";
+  const [guestAccessToken, setGuestAccessToken] = useState(() =>
+    typeof window !== "undefined" ? localStorage.getItem("arc_guest_token") || "" : ""
+  );
+  const [guestRunsRemaining, setGuestRunsRemaining] = useState(null);
+  const accessToken = session?.access_token || guestAccessToken || "";
+  const isGuest = Boolean(guestAccessToken && !session?.access_token);
 
   const selectedNode = useMemo(
     () => runDetail?.nodes?.find((n) => n.id === selectedNodeId),
@@ -736,16 +744,52 @@ export default function App() {
     if (!raw) return fallback;
     try {
       const parsed = JSON.parse(raw);
-      return parsed?.detail || parsed?.message || fallback;
+      const d = parsed?.detail;
+      if (typeof d === "string") return d;
+      if (d && typeof d === "object" && d.message) return String(d.message);
+      return parsed?.message || fallback;
     } catch {
       return raw;
     }
   }
 
+  const fetchMe = useCallback(async () => {
+    if (!accessToken) return;
+    try {
+      const res = await fetch(apiUrl("/api/me"), { headers: { Authorization: `Bearer ${accessToken}` } });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.is_guest && typeof data.runs_remaining === "number") {
+        setGuestRunsRemaining(data.runs_remaining);
+      } else {
+        setGuestRunsRemaining(null);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [accessToken]);
+
+  useEffect(() => {
+    if (session?.access_token && guestAccessToken) {
+      localStorage.removeItem("arc_guest_token");
+      localStorage.removeItem("arc_guest_session_id");
+      setGuestAccessToken("");
+    }
+  }, [session?.access_token, guestAccessToken]);
+
+  useEffect(() => {
+    fetchMe();
+  }, [fetchMe]);
+
   async function signOut() {
     setError("");
+    localStorage.removeItem("arc_guest_token");
+    localStorage.removeItem("arc_guest_session_id");
+    setGuestAccessToken("");
+    setGuestRunsRemaining(null);
     const { error: signOutError } = await supabase.auth.signOut();
     if (signOutError) setError(signOutError.message);
+    window.location.assign("/login");
   }
 
   function toggleTheme() {
@@ -806,7 +850,7 @@ export default function App() {
 
   async function createRun() {
     if (!accessToken) {
-      setError("Please sign in with Google first.");
+      setError("Please sign in or continue as guest from the login page.");
       return;
     }
     if (!query.trim()) return;
@@ -826,6 +870,7 @@ export default function App() {
       setSelectedRunId(data.run_id);
       setQuery("");
       await fetchRuns();
+      await fetchMe();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1085,6 +1130,61 @@ export default function App() {
     }
   }
 
+  async function fetchMailGmailStatus() {
+    if (!accessToken || isGuest) return null;
+    setMailStatusLoading(true);
+    try {
+      const res = await fetch(apiUrl("/api/mail/status"), { headers: getAuthHeaders() });
+      if (!res.ok) {
+        setMailGmailStatus({ gmail_configured: false, linked: false, google_email: null });
+        return null;
+      }
+      const data = await res.json();
+      setMailGmailStatus(data);
+      return data;
+    } catch {
+      setMailGmailStatus({ gmail_configured: false, linked: false, google_email: null });
+      return null;
+    } finally {
+      setMailStatusLoading(false);
+    }
+  }
+
+  async function beginMailOAuth() {
+    setMailOAuthBusy(true);
+    setMailError("");
+    try {
+      const res = await fetch(apiUrl("/api/mail/oauth/begin"), {
+        method: "POST",
+        headers: getAuthHeaders(),
+      });
+      if (!res.ok) {
+        setMailError(await readErrorMessage(res, "Could not start Gmail connection"));
+        return;
+      }
+      const data = await res.json();
+      if (data.authorization_url) window.location.href = data.authorization_url;
+    } catch (e) {
+      setMailError(String(e));
+    } finally {
+      setMailOAuthBusy(false);
+    }
+  }
+
+  async function disconnectMailGmail() {
+    setMailError("");
+    try {
+      const res = await fetch(apiUrl("/api/mail/link"), { method: "DELETE", headers: getAuthHeaders() });
+      if (!res.ok) throw new Error(await readErrorMessage(res, "Failed to disconnect Gmail"));
+      await fetchMailGmailStatus();
+      setMailThreads([]);
+      setSelectedThreadId("");
+      setMailReplyBody("");
+    } catch (e) {
+      setMailError(String(e));
+    }
+  }
+
   async function fetchMailMessages(pageToken = null, pageNum = 1) {
     if (!accessToken) return;
     setMailLoading(true);
@@ -1097,8 +1197,32 @@ export default function App() {
       if (res.status === 503) {
         const detail = await readErrorMessage(res, "Gmail not configured");
         setMailError(detail);
-        setMailMessages([]);
+        setMailThreads([]);
         return;
+      }
+      if (res.status === 403) {
+        const raw = await res.text();
+        let parsed = null;
+        try {
+          parsed = raw ? JSON.parse(raw) : null;
+        } catch {
+          parsed = null;
+        }
+        const d = parsed?.detail;
+        if (d && typeof d === "object" && d.code === "GMAIL_NOT_LINKED") {
+          setMailGmailStatus((prev) => ({
+            gmail_configured: true,
+            linked: false,
+            google_email: null,
+            ...(prev && typeof prev === "object" ? prev : {}),
+          }));
+          setMailThreads([]);
+          setSelectedThreadId("");
+          return;
+        }
+        throw new Error(
+          typeof d === "object" && d.message ? String(d.message) : raw || "Mail access denied"
+        );
       }
       if (!res.ok) throw new Error(await readErrorMessage(res, "Failed to load mail"));
       const data = await res.json();
@@ -1248,12 +1372,39 @@ export default function App() {
   }, [accessToken, authLoading]);
 
   useEffect(() => {
-    if (activeSection === "mail" && accessToken) {
-      setMailPageTokens({});
-      setMailCurrentPage(1);
-      fetchMailMessages(null, 1);
-    }
-  }, [activeSection, accessToken, mailFilter]);
+    if (!accessToken || isGuest) return;
+    const p = new URLSearchParams(window.location.search);
+    if (!p.has("mail_connected") && !p.get("mail_error")) return;
+    const err = p.get("mail_error");
+    if (p.has("mail_connected")) setActiveSection("mail");
+    if (err) setMailError(decodeURIComponent(err.replace(/\+/g, " ")));
+    p.delete("mail_connected");
+    p.delete("mail_error");
+    const qs = p.toString();
+    window.history.replaceState({}, "", `${window.location.pathname}${qs ? `?${qs}` : ""}`);
+    fetchMailGmailStatus();
+  }, [accessToken, isGuest]);
+
+  useEffect(() => {
+    if (activeSection !== "mail" || !accessToken || isGuest) return;
+    let cancelled = false;
+    (async () => {
+      const st = await fetchMailGmailStatus();
+      if (cancelled) return;
+      if (st?.linked) {
+        setMailPageTokens({});
+        setMailCurrentPage(1);
+        fetchMailMessages(null, 1);
+      } else {
+        setMailThreads([]);
+        setSelectedThreadId("");
+        setMailNextPageToken(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSection, accessToken, mailFilter, isGuest]);
 
   async function fetchScheduledJobs() {
     if (!accessToken) return;
@@ -1273,8 +1424,8 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (activeSection === "scheduler" && accessToken) fetchScheduledJobs();
-  }, [activeSection, accessToken]);
+    if (activeSection === "scheduler" && accessToken && !isGuest) fetchScheduledJobs();
+  }, [activeSection, accessToken, isGuest]);
 
   useEffect(() => {
     if (activeSection !== "scheduler") setSchedulerResultDrawerJobId(null);
@@ -1950,7 +2101,15 @@ export default function App() {
   return (
     <div className={`app-page theme-${theme}`}>
       <header className="top-nav">
-        <div className="brand-title">ArcReactor Agent</div>
+        <div className="top-nav-left">
+          <div className="brand-title">ArcReactor Agent</div>
+          {isGuest ? (
+            <div className="top-nav-guest-pill" title="Free guest session on this device">
+              Guest
+              {guestRunsRemaining !== null ? ` · ${guestRunsRemaining} free runs left` : ""}
+            </div>
+          ) : null}
+        </div>
         <div className="top-nav-actions">
           <button onClick={toggleTheme}>
             {theme === "dark" ? "Light Theme" : "Dark Theme"}
@@ -2273,9 +2432,54 @@ export default function App() {
         </aside>
         </>
         ) : activeSection === "mail" ? (
+          isGuest ? (
+            <main className="guest-signin-gate-panel">
+              <div className="guest-signin-gate-card">
+                <h2>Mail</h2>
+                <p>
+                  Gmail is tied to a Google account. Sign in with Google to use Mail. As a guest you can still run research and use
+                  Notepad on this device.
+                </p>
+                <a className="guest-signin-gate-link" href="/login">
+                  Sign in with Google
+                </a>
+              </div>
+            </main>
+          ) : (
           <main className="mail-panel-full">
+            {mailGmailStatus === null ? (
+              <div className="mail-connect-panel">
+                <p className="mail-connect-hint">Loading mail settings…</p>
+              </div>
+            ) : !mailGmailStatus.gmail_configured ? (
+              <div className="mail-connect-panel">
+                <h2>Mail</h2>
+                <p>
+                  Gmail is not configured on the server. Add <code>credentials.json</code> (OAuth 2.0 <strong>Web application</strong> client
+                  in Google Cloud) and set <code>GMAIL_OAUTH_REDIRECT_URI</code> to match an authorized redirect URI, then restart the API.
+                </p>
+              </div>
+            ) : mailGmailStatus && !mailGmailStatus.linked ? (
+              <div className="mail-connect-panel">
+                <h2>Connect Gmail</h2>
+                <p>
+                  You will be redirected to Google to sign in and approve access. Each user who logs into Arc Reactor links their own
+                  mailbox; your mail is not shared with other accounts.
+                </p>
+                <button type="button" className="mail-connect-btn" onClick={beginMailOAuth} disabled={mailOAuthBusy}>
+                  {mailOAuthBusy ? "Opening Google…" : "Connect Gmail"}
+                </button>
+                {mailError ? <div className="mail-error mail-error-connect">{mailError}</div> : null}
+              </div>
+            ) : (
+            <>
             <div className="mail-panel-header-bar">
               <span className="mail-panel-title">Mail</span>
+              {mailGmailStatus?.google_email ? (
+                <span className="mail-linked-email" title="Connected mailbox">
+                  {mailGmailStatus.google_email}
+                </span>
+              ) : null}
               <div className="mail-filter-tabs">
                 <button
                   className={`mail-filter-tab ${mailFilter === "all" ? "active" : ""}`}
@@ -2318,6 +2522,9 @@ export default function App() {
                 type="button"
               >
                 {mailLoading ? "Loading..." : "Refresh"}
+              </button>
+              <button className="mail-disconnect-btn" onClick={disconnectMailGmail} type="button">
+                Disconnect Gmail
               </button>
             </div>
             <div className="mail-panel-content">
@@ -2447,8 +2654,25 @@ export default function App() {
                 </div>
               </div>
             </div>
+            </>
+            )}
           </main>
+          )
         ) : activeSection === "scheduler" ? (
+          isGuest ? (
+            <main className="guest-signin-gate-panel">
+              <div className="guest-signin-gate-card">
+                <h2>Scheduler</h2>
+                <p>
+                  Scheduled jobs are saved to your account. Sign in with Google to create and manage schedules. Guests can still use
+                  Agent Run for on-demand research.
+                </p>
+                <a className="guest-signin-gate-link" href="/login">
+                  Sign in with Google
+                </a>
+              </div>
+            </main>
+          ) : (
           <main className="scheduler-panel">
             <div className="scheduler-header">
               <span className="scheduler-title">Scheduler</span>
@@ -2749,6 +2973,7 @@ export default function App() {
               </>
             ) : null}
           </main>
+          )
         ) : (
           <main className="notes-panel">
             <div className="notes-menubar">

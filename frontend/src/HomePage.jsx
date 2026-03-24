@@ -44,6 +44,9 @@ export default function HomePage() {
     supabase.auth.getSession().then(({ data }) => {
       if (!mounted) return;
       if (data.session) navigate("/agent", { replace: true });
+      else if (typeof localStorage !== "undefined" && localStorage.getItem("arc_guest_token")) {
+        navigate("/agent", { replace: true });
+      }
     });
 
     const {

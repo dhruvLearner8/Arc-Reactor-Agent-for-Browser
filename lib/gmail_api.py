@@ -1,6 +1,10 @@
 """
 Gmail API helper: list, get, send, reply. Used by Mail API routes and Gmail MCP.
 Requires credentials.json + token.json (run generate_gmail_token.py once).
+
+OAuth / production: if Google blocks “wrong” Google accounts during consent, your
+OAuth client is likely in Testing mode — add Test users or publish the app; see
+AGENT_README.md §17. token.json authorizes one mailbox for the whole server.
 """
 from __future__ import annotations
 

@@ -88,7 +88,7 @@ See **§14** for persistence, APScheduler, and UI behavior.
 - **`activity`** — short human-readable log lines for the inspector
 - **`scheduled_job_id`** (optional) — set when the run was started by a scheduled job or **run-now** from the Scheduler.
 
-Persistence: **local JSON** under `memory/local_runs/` when `LOCAL_RUN_STORE=1`, else **Supabase** when configured. Session graph files under `memory/session_summaries_index/` when `SAVE_LOCAL_SESSIONS` is on (see env table).
+Persistence: **local JSON** under `memory/local_runs/` when `LOCAL_RUN_STORE=1`, else **Supabase** `chat_runs` + logs when the service role is configured and `LOCAL_RUN_STORE` is off. **Scheduler + Notepad** use Supabase only when **`_use_supabase_store()`** is true (same condition: not `LOCAL_RUN_STORE` and Supabase enabled); otherwise jobs live in `memory/scheduled_jobs/jobs.json` and notes in `memory/notes/{user}.json`. **Gmail** tokens use Supabase whenever `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set (`RUN_STORE.enabled`), independent of `LOCAL_RUN_STORE`. Session graph files under `memory/session_summaries_index/` when `SAVE_LOCAL_SESSIONS` is on (see env table).
 
 ---
 
@@ -178,7 +178,7 @@ When tools return odd shapes, **`multi_mcp`** may coerce types so **`AgentRunner
 
 | Variable | Effect |
 |----------|--------|
-| `LOCAL_RUN_STORE` | `1` → persist run list/detail to `memory/local_runs/*.json` |
+| `LOCAL_RUN_STORE` | `1` → run list/detail + admin logs in `memory/local_runs/`; **Notepad** + **scheduler** skip Supabase (see `_use_supabase_store()`). **Gmail** tokens still use Supabase if `SUPABASE_SERVICE_ROLE_KEY` is set. Use **`0` or unset** for production so runs, scheduler, and notes use Supabase. |
 | `SAVE_LOCAL_SESSIONS` | `0` / `false` → skip writing session graph files under `memory/session_summaries_index/` |
 | `DAG_MAX_ITERATIONS` | Cap for DAG scheduler loop in `core/loop.py` (default 500) |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Cloud persistence + auth alignment |
@@ -197,7 +197,7 @@ See also `README.md` and `docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md` for depl
 - **List / APScheduler reload:** **`_list_scheduled_jobs_merged`** and **`_all_enabled_scheduled_jobs_merged`** merge **cloud + local** by job `id` (local wins on conflict). This avoids “empty list” when Supabase upsert fails but the job exists locally.
 - **Owner matching:** **`_owner_ids_match`** normalizes UUID strings (case/spacing) for list/delete.
 - **APScheduler:** **`AsyncIOScheduler`** in app **lifespan**; **`_reload_scheduled_jobs`** registers cron or interval jobs; firing calls **`_on_scheduled_job_fire`** → **`_start_agent_run_for_scheduled_job`** + **`_after_scheduled_run_started`** (persist **`last_run_id`** locally always; cloud when configured).
-- **Supabase migrations:** `db/migrations/003_scheduled_jobs.sql` (table), `004_scheduled_jobs_last_run.sql` (`last_run_id`, `last_run_at`). Not required for pure local file mode if `LOCAL_RUN_STORE=1` disables cloud store (see `_use_supabase_store()`).
+- **Supabase migrations:** `003_scheduled_jobs.sql`, `004_scheduled_jobs_last_run.sql`, `005_user_gmail_credentials.sql`, **`006_user_notepad.sql`**. Not applied when `LOCAL_RUN_STORE=1` disables cloud store (see `_use_supabase_store()`).
 
 ---
 
@@ -222,7 +222,52 @@ See also `README.md` and `docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md` for depl
 
 ---
 
-## 17. Glossary
+## 17. Gmail API & Google Cloud OAuth (“ask your developer” / wrong account)
+
+### How Mail works in this repo (important)
+
+- The **Mail tab** uses **per-user Gmail OAuth**: each signed-in Supabase user can **Connect Gmail** once; the backend stores that user’s refresh token and builds Gmail API calls as **`userId: "me"`** for **that** account only.
+- **OAuth client file:** **`credentials.json`** at the **project root** (same `SCOPES` as `lib/gmail_api.py`). In Google Cloud, create an OAuth client of type **Web application** and set an **Authorized redirect URI** that matches the backend exactly (see env vars below).
+- **Where tokens are stored**
+  - If **`SUPABASE_URL`** and **`SUPABASE_SERVICE_ROLE_KEY`** are set (same condition as the cloud run store): table **`user_gmail_credentials`** (migration `db/migrations/005_user_gmail_credentials.sql`). Only the **service role** should read/write this table; there are **no** browser-facing RLS policies.
+  - Local / file-backed mode: **`memory/gmail_users/{owner_user_id}.json`** (gitignored via `memory/gmail_users/`).
+- **API routes:** `GET /api/mail/status`, `POST /api/mail/oauth/begin`, `GET /api/mail/oauth/callback`, `DELETE /api/mail/link`; list/read/send/reply require a linked account or return **403** with `detail.code === "GMAIL_NOT_LINKED"`.
+- **Environment**
+  - **`GMAIL_OAUTH_REDIRECT_URI`** — must match the Google Cloud “Authorized redirect URI” (default in code: `http://127.0.0.1:8000/api/mail/oauth/callback`).
+  - **`MAIL_OAUTH_SUCCESS_URL`** — where the browser is sent after a successful link (default: frontend `.../agent?mail_connected=1`).
+- **`token.json` + `generate_gmail_token.py`** still exist for **`lib/gmail_api.get_gmail_service()`**, used by the **Gmail MCP server** (`mcp_servers/server_gmail.py`) — a **single** server mailbox, separate from the Mail tab’s per-user flow.
+
+### Why Google said another email “was not given permission”
+
+That happens when the OAuth client’s **consent screen** is in **Testing** (the default for new projects):
+
+- Only addresses listed under **Test users** can complete the OAuth flow.
+- If you pick a different Google account in the browser, Google blocks access and may say to contact the **developer** (you) to grant access.
+
+**Fix for development / a small fixed set of accounts**
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/) → your project.
+2. **APIs & Services** → **OAuth consent screen**.
+3. Under **Test users**, click **Add users** and add **every** `@gmail.com` or Workspace address that should be allowed to complete **Connect Gmail** (or run `generate_gmail_token.py` for the MCP path).
+4. Save, then use **Connect Gmail** in the Mail tab (or the token script for MCP) with one of those accounts.
+
+**Fix for production / many customers**
+
+1. Same screen: set **Publishing status** to **In production** (publish the app). That removes the test-user-only restriction for consent (subject to Google’s rules).
+2. **Gmail API scopes** used here (`gmail.readonly`, `gmail.send`, `gmail.modify` in `lib/gmail_api.py`) are **sensitive / restricted**. For **external** users, Google typically requires:
+   - **OAuth app verification** (and sometimes a **security assessment** for restricted scopes), and  
+   - Accurate **app domain**, **privacy policy**, and **scope justification** on the consent screen.
+3. **Google Workspace** org-internal tools can sometimes use **Internal** user type so only your domain accounts see the app — still configure consent correctly.
+
+Official references (verify current policy on Google’s side):
+
+- [OAuth consent screen publishing](https://support.google.com/cloud/answer/10311615)
+- [Google API Services User Data Policy](https://developers.google.com/terms/api-services-user-data-policy)
+- [Gmail API scopes](https://developers.google.com/gmail/api/auth/scopes)
+
+---
+
+## 18. Glossary
 
 | Term | Meaning |
 |------|---------|
@@ -236,4 +281,4 @@ See also `README.md` and `docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md` for depl
 
 ---
 
-*Last aligned with repo layout: S8 Share (Scheduler, Web URLs tab, dual scheduled-job persistence). If something disagrees with code, trust the code and update this file.*
+*Last aligned with repo layout: S8 Share (Scheduler, Web URLs tab, dual scheduled-job persistence, §17 per-user Gmail OAuth). If something disagrees with code, trust the code and update this file.*

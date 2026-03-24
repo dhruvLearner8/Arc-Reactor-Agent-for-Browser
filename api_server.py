@@ -1,23 +1,26 @@
 import asyncio
 import json
 import os
+import secrets
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from auth import AuthUser, get_current_user
+from auth import AuthUser, get_current_user, guest_session_key, mint_guest_access_token
+from guest_quota import guest_run_limit, guest_runs_used, guest_try_consume_run
 from agents.base_agent import AgentRunner
 from core.loop import AgentLoop4
 from mcp_servers.multi_mcp import MultiMCP
@@ -98,6 +101,21 @@ class ScheduledJobUpdateRequest(BaseModel):
     cron_expr: str | None = None
     interval_minutes: int | None = Field(default=None, ge=1, le=10080)
     enabled: bool | None = None
+
+
+class GuestAuthRequest(BaseModel):
+    """Stable browser id so quota survives token refresh; omit to start a new guest session."""
+
+    client_session_id: str | None = None
+
+
+class GuestAuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    guest_session_id: str
+    runs_used: int
+    runs_limit: int
+    runs_remaining: int
 
 
 JOB_SCHEDULER: AsyncIOScheduler | None = None
@@ -392,6 +410,102 @@ class SupabaseRunStore:
         except Exception:
             return []
 
+    async def get_user_gmail_credentials(self, user_id: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/user_gmail_credentials",
+                params={
+                    "select": "google_email,credentials_json",
+                    "owner_user_id": f"eq.{user_id}",
+                    "limit": "1",
+                },
+            )
+            if isinstance(rows, list) and rows:
+                return rows[0]
+        except Exception as exc:
+            print(f"[gmail] get_user_gmail_credentials failed: {exc}")
+        return None
+
+    async def upsert_user_gmail_credentials(
+        self, user_id: str, google_email: str | None, credentials_json: dict[str, Any]
+    ) -> None:
+        if not self.enabled:
+            return
+        payload = [
+            {
+                "owner_user_id": user_id,
+                "google_email": google_email,
+                "credentials_json": credentials_json,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        ]
+        await self._request(
+            "POST",
+            "/rest/v1/user_gmail_credentials",
+            params={"on_conflict": "owner_user_id"},
+            payload=payload,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    async def delete_user_gmail_credentials(self, user_id: str) -> None:
+        if not self.enabled:
+            return
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.delete(
+                f"{self.url}/rest/v1/user_gmail_credentials",
+                params={"owner_user_id": f"eq.{user_id}"},
+                headers=self._headers,
+            )
+            resp.raise_for_status()
+
+    async def get_notepad_items(self, user_id: str) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/user_notepad",
+                params={
+                    "select": "items",
+                    "owner_user_id": f"eq.{user_id}",
+                    "limit": "1",
+                },
+            )
+            if not isinstance(rows, list) or not rows:
+                return []
+            raw = rows[0].get("items")
+            if raw is None:
+                return []
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            if not isinstance(raw, list):
+                return []
+            return [x for x in raw if isinstance(x, dict)]
+        except Exception as exc:
+            print(f"[notepad] get_notepad_items failed: {exc}")
+            return []
+
+    async def set_notepad_items(self, user_id: str, items: list[dict[str, Any]]) -> None:
+        if not self.enabled:
+            return
+        payload = [
+            {
+                "owner_user_id": user_id,
+                "items": items,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        ]
+        await self._request(
+            "POST",
+            "/rest/v1/user_notepad",
+            params={"on_conflict": "owner_user_id"},
+            payload=payload,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
     async def list_logs(self, limit: int = 500) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
@@ -408,6 +522,117 @@ class SupabaseRunStore:
 
 
 RUN_STORE = SupabaseRunStore()
+
+LOCAL_GMAIL_USERS_DIR = BASE_DIR / "memory" / "gmail_users"
+GMAIL_OAUTH_STATES: dict[str, tuple[str, float]] = {}
+
+
+def _local_gmail_cred_path(user_id: str) -> Path:
+    safe = user_id.replace("/", "_").replace("\\", "_")
+    LOCAL_GMAIL_USERS_DIR.mkdir(parents=True, exist_ok=True)
+    return LOCAL_GMAIL_USERS_DIR / f"{safe}.json"
+
+
+def _gmail_oauth_redirect_uri() -> str:
+    return (os.getenv("GMAIL_OAUTH_REDIRECT_URI") or "http://127.0.0.1:8000/api/mail/oauth/callback").strip()
+
+
+def _mail_oauth_success_url() -> str:
+    return (os.getenv("MAIL_OAUTH_SUCCESS_URL") or "http://127.0.0.1:5173/agent?mail_connected=1").strip()
+
+
+def _prune_gmail_oauth_states() -> None:
+    now = time.time()
+    for k, (_, exp) in list(GMAIL_OAUTH_STATES.items()):
+        if exp < now:
+            GMAIL_OAUTH_STATES.pop(k, None)
+
+
+def _gmail_oauth_client_configured() -> bool:
+    try:
+        from lib.gmail_oauth import gmail_credentials_file_exists
+
+        return gmail_credentials_file_exists()
+    except Exception:
+        return False
+
+
+async def _load_user_gmail_row(user_id: str) -> dict[str, Any] | None:
+    if RUN_STORE.enabled:
+        return await RUN_STORE.get_user_gmail_credentials(user_id)
+    p = _local_gmail_cred_path(user_id)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "credentials_json" in data:
+            return {"google_email": data.get("google_email"), "credentials_json": data["credentials_json"]}
+    except Exception:
+        return None
+    return None
+
+
+async def _save_user_gmail_credentials(user_id: str, google_email: str | None, creds_dict: dict[str, Any]) -> None:
+    if RUN_STORE.enabled:
+        await RUN_STORE.upsert_user_gmail_credentials(user_id, google_email, creds_dict)
+    else:
+        p = _local_gmail_cred_path(user_id)
+        p.write_text(
+            json.dumps({"google_email": google_email, "credentials_json": creds_dict}, indent=2),
+            encoding="utf-8",
+        )
+
+
+async def _delete_user_gmail_credentials_store(user_id: str) -> None:
+    if RUN_STORE.enabled:
+        try:
+            await RUN_STORE.delete_user_gmail_credentials(user_id)
+        except Exception:
+            pass
+    else:
+        p = _local_gmail_cred_path(user_id)
+        if p.exists():
+            p.unlink()
+
+
+async def _get_gmail_service_for_user(owner_user_id: str):
+    from lib.gmail_oauth import (
+        build_gmail_service,
+        credentials_from_stored_dict,
+        credentials_to_storable_dict,
+        refresh_credentials_if_needed,
+    )
+
+    row = await _load_user_gmail_row(owner_user_id)
+    if not row:
+        return None, None
+    raw = row.get("credentials_json")
+    if raw is None:
+        return None, None
+    if isinstance(raw, str):
+        try:
+            creds_dict = json.loads(raw)
+        except Exception:
+            return None, None
+    elif isinstance(raw, dict):
+        creds_dict = dict(raw)
+    else:
+        return None, None
+    if not creds_dict:
+        return None, None
+    creds = credentials_from_stored_dict(creds_dict)
+
+    def _refresh_work() -> dict[str, Any] | None:
+        if refresh_credentials_if_needed(creds):
+            return credentials_to_storable_dict(creds)
+        return None
+
+    updated = await asyncio.to_thread(_refresh_work)
+    if updated:
+        await _save_user_gmail_credentials(owner_user_id, row.get("google_email"), updated)
+        creds = credentials_from_stored_dict(updated)
+
+    return build_gmail_service(creds), row.get("google_email")
 
 
 def _load_session_file(path: Path) -> dict[str, Any]:
@@ -449,6 +674,23 @@ def _save_notes(user_id: str, notes: list[dict[str, Any]]) -> None:
     path = _notes_path(user_id)
     with path.open("w", encoding="utf-8") as f:
         json.dump(notes, f, ensure_ascii=False, indent=2)
+
+
+async def _notes_for_user(user_id: str) -> list[dict[str, Any]]:
+    if _use_supabase_store():
+        try:
+            cloud = await RUN_STORE.get_notepad_items(user_id)
+            return cloud
+        except Exception as exc:
+            print(f"[notepad] Supabase read failed, using local file: {exc}")
+    return _load_notes(user_id)
+
+
+async def _persist_notes(user_id: str, notes: list[dict[str, Any]]) -> None:
+    if _use_supabase_store():
+        await RUN_STORE.set_notepad_items(user_id, notes)
+    else:
+        _save_notes(user_id, notes)
 
 
 def _save_local_run_record(run_id: str) -> None:
@@ -656,6 +898,25 @@ def _run_belongs_to_user(run: dict[str, Any] | None, user_id: str) -> bool:
 
 def _use_supabase_store() -> bool:
     return (not LOCAL_RUN_STORE) and RUN_STORE.enabled
+
+
+def _cloud_persist_runs(owner_user_id: str) -> bool:
+    """Guests never sync runs to Supabase (avoids invalid FK / PII)."""
+    if isinstance(owner_user_id, str) and owner_user_id.startswith("guest:"):
+        return False
+    return _use_supabase_store()
+
+
+async def require_full_account(current_user: AuthUser = Depends(get_current_user)) -> AuthUser:
+    if current_user.is_guest:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "SIGN_IN_REQUIRED",
+                "message": "This feature requires signing in with Google.",
+            },
+        )
+    return current_user
 
 
 def _is_admin_user(user_id: str) -> bool:
@@ -989,9 +1250,10 @@ async def _run_research_followup_in_run(
         _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
         _publish_event(run_id, {"status": "completed", "snapshot": snapshot}, event="run_complete")
         run_record = _build_run_record(run_id)
-        if run_record and _use_supabase_store():
+        ouid = owner_user_id or ""
+        if run_record and _cloud_persist_runs(ouid):
             await RUN_STORE.upsert_run(run_record)
-        if _use_supabase_store():
+        if _cloud_persist_runs(ouid):
             await RUN_STORE.insert_log(
                 level="INFO",
                 event_type="run_followup_completed",
@@ -1017,7 +1279,8 @@ async def _run_research_followup_in_run(
             snapshot["error"] = str(exc)
             _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
             _publish_event(run_id, {"status": "failed", "error": str(exc)}, event="run_error")
-        if _use_supabase_store():
+        ouid = owner_user_id or ""
+        if _cloud_persist_runs(ouid):
             await RUN_STORE.insert_log(
                 level="ERROR",
                 event_type="run_followup_failed",
@@ -1076,7 +1339,8 @@ async def _watch_session_file(run_id: str, stop_event: asyncio.Event) -> None:
                 snapshot["status"] = run.get("status", snapshot.get("status", "running"))
                 _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
                 run_record = _build_run_record(run_id)
-                if run_record and _use_supabase_store():
+                owner_uid = str(run.get("owner_user_id") or "")
+                if run_record and _cloud_persist_runs(owner_uid):
                     await RUN_STORE.upsert_run(run_record)
         await asyncio.sleep(0.6)
 
@@ -1164,12 +1428,12 @@ async def _after_scheduled_run_started(
     job_id = job.get("id") or ""
     owner_user_id = job.get("owner_user_id") or ""
     owner_email = job.get("owner_email") or ""
-    if _use_supabase_store():
+    if _cloud_persist_runs(owner_user_id):
         await RUN_STORE.upsert_user(owner_user_id, owner_email)
     run_record = _build_run_record(run_id)
-    if run_record and _use_supabase_store():
+    if run_record and _cloud_persist_runs(owner_user_id):
         await RUN_STORE.upsert_run(run_record)
-    if _use_supabase_store():
+    if _cloud_persist_runs(owner_user_id):
         await RUN_STORE.insert_log(
             level="INFO",
             event_type=event_type,
@@ -1267,9 +1531,9 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
     RUNS[run_id]["status"] = "starting"
     _save_local_run_record(run_id)
     run_record = _build_run_record(run_id)
-    if run_record and _use_supabase_store():
+    if run_record and _cloud_persist_runs(owner_user_id):
         await RUN_STORE.upsert_run(run_record)
-    if _use_supabase_store():
+    if _cloud_persist_runs(owner_user_id):
         await RUN_STORE.insert_log(
             level="INFO",
             event_type="run_started",
@@ -1310,7 +1574,7 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 return
             run["last_progress_persist_at"] = now
             run_record = _build_run_record(run_id)
-            if run_record and _use_supabase_store():
+            if run_record and _cloud_persist_runs(owner_user_id):
                 await RUN_STORE.upsert_run(run_record)
 
         async def on_clarification(step_id: str, output: dict[str, Any]) -> str:
@@ -1402,7 +1666,7 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 bootstrap_snapshot["pending_clarification"] = RUNS[run_id].get("pending_clarification")
                 _publish_event(run_id, {"snapshot": bootstrap_snapshot}, event="run_update")
                 run_record = _build_run_record(run_id)
-                if run_record and _use_supabase_store():
+                if run_record and _cloud_persist_runs(owner_user_id):
                     await RUN_STORE.upsert_run(run_record)
                 break
             if run_task.done():
@@ -1445,7 +1709,7 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
             {"status": "completed", "summary": summary, "snapshot": final_snapshot},
             event="run_complete",
         )
-        if _use_supabase_store():
+        if _cloud_persist_runs(owner_user_id):
             await RUN_STORE.insert_log(
                 level="INFO",
                 event_type="run_completed",
@@ -1455,7 +1719,7 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 payload={"session_id": session_id, "status": "completed"},
             )
         run_record = _build_run_record(run_id)
-        if run_record and _use_supabase_store():
+        if run_record and _cloud_persist_runs(owner_user_id):
             await RUN_STORE.upsert_run(run_record)
     except asyncio.TimeoutError:
         RUNS[run_id]["status"] = "failed"
@@ -1464,7 +1728,7 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
         RUNS[run_id]["error"] = err_msg
         _save_local_run_record(run_id)
         _publish_event(run_id, {"status": "failed", "error": err_msg}, event="run_error")
-        if _use_supabase_store():
+        if _cloud_persist_runs(owner_user_id):
             await RUN_STORE.insert_log(
                 level="ERROR",
                 event_type="run_failed",
@@ -1474,14 +1738,14 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 payload={"error": err_msg, "timeout_sec": timeout_sec},
             )
         run_record = _build_run_record(run_id)
-        if run_record and _use_supabase_store():
+        if run_record and _cloud_persist_runs(owner_user_id):
             await RUN_STORE.upsert_run(run_record)
     except Exception as exc:
         RUNS[run_id]["status"] = "failed"
         RUNS[run_id]["error"] = str(exc)
         _save_local_run_record(run_id)
         _publish_event(run_id, {"status": "failed", "error": str(exc)}, event="run_error")
-        if _use_supabase_store():
+        if _cloud_persist_runs(owner_user_id):
             await RUN_STORE.insert_log(
                 level="ERROR",
                 event_type="run_failed",
@@ -1491,7 +1755,7 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 payload={"error": str(exc)},
             )
         run_record = _build_run_record(run_id)
-        if run_record and _use_supabase_store():
+        if run_record and _cloud_persist_runs(owner_user_id):
             await RUN_STORE.upsert_run(run_record)
     finally:
         stop_event.set()
@@ -1509,14 +1773,60 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/auth/guest", response_model=GuestAuthResponse)
+async def auth_guest(body: GuestAuthRequest) -> GuestAuthResponse:
+    try:
+        if body.client_session_id:
+            sid = str(UUID(body.client_session_id))
+        else:
+            sid = str(uuid4())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid client_session_id") from None
+
+    try:
+        token = mint_guest_access_token(sid)
+    except RuntimeError:
+        raise HTTPException(
+            status_code=503,
+            detail="Guest sign-in is not configured. Set SUPABASE_JWT_SECRET on the server.",
+        ) from None
+
+    limit = guest_run_limit()
+    used = guest_runs_used(sid)
+    return GuestAuthResponse(
+        access_token=token,
+        guest_session_id=sid,
+        runs_used=used,
+        runs_limit=limit,
+        runs_remaining=max(0, limit - used),
+    )
+
+
 @app.get("/api/me")
 async def me(current_user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
-    return {"user_id": current_user.user_id, "email": current_user.email}
+    out: dict[str, Any] = {
+        "user_id": current_user.user_id,
+        "email": current_user.email,
+        "is_guest": current_user.is_guest,
+    }
+    if current_user.is_guest:
+        gsk = guest_session_key(current_user.user_id)
+        if gsk:
+            limit = guest_run_limit()
+            used = guest_runs_used(gsk)
+            out["runs_used"] = used
+            out["runs_limit"] = limit
+            out["runs_remaining"] = max(0, limit - used)
+    else:
+        out["runs_used"] = None
+        out["runs_limit"] = None
+        out["runs_remaining"] = None
+    return out
 
 
 @app.get("/api/notes")
 async def list_notes(current_user: AuthUser = Depends(get_current_user)) -> list[dict[str, Any]]:
-    notes = _load_notes(current_user.user_id)
+    notes = await _notes_for_user(current_user.user_id)
     for note in notes:
         note["kind"] = (note.get("kind") or "file").strip().lower()
         note["name"] = (note.get("name") or "untitled.txt").strip() or "untitled.txt"
@@ -1534,7 +1844,7 @@ async def list_notes(current_user: AuthUser = Depends(get_current_user)) -> list
 async def create_note(
     request: NoteCreateRequest, current_user: AuthUser = Depends(get_current_user)
 ) -> dict[str, Any]:
-    notes = _load_notes(current_user.user_id)
+    notes = await _notes_for_user(current_user.user_id)
     kind = (request.kind or "file").strip().lower()
     if kind not in {"file", "folder"}:
         raise HTTPException(status_code=400, detail="Invalid note kind")
@@ -1560,7 +1870,7 @@ async def create_note(
         "updated_at": now,
     }
     notes.insert(0, note)
-    _save_notes(current_user.user_id, notes)
+    await _persist_notes(current_user.user_id, notes)
     return note
 
 
@@ -1568,7 +1878,7 @@ async def create_note(
 async def update_note(
     note_id: str, request: NoteUpdateRequest, current_user: AuthUser = Depends(get_current_user)
 ) -> dict[str, Any]:
-    notes = _load_notes(current_user.user_id)
+    notes = await _notes_for_user(current_user.user_id)
     for note in notes:
         if note.get("id") == note_id:
             if request.name is not None:
@@ -1595,14 +1905,14 @@ async def update_note(
             if request.content is not None and (note.get("kind") or "file") != "folder":
                 note["content"] = request.content
             note["updated_at"] = datetime.utcnow().isoformat()
-            _save_notes(current_user.user_id, notes)
+            await _persist_notes(current_user.user_id, notes)
             return note
     raise HTTPException(status_code=404, detail="Note not found")
 
 
 @app.delete("/api/notes/{note_id}")
 async def delete_note(note_id: str, current_user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
-    notes = _load_notes(current_user.user_id)
+    notes = await _notes_for_user(current_user.user_id)
     note_ids = {n.get("id") for n in notes}
     if note_id not in note_ids:
         raise HTTPException(status_code=404, detail="Note not found")
@@ -1618,13 +1928,13 @@ async def delete_note(note_id: str, current_user: AuthUser = Depends(get_current
                 to_delete.add(nid)
                 changed = True
     filtered = [n for n in notes if n.get("id") not in to_delete]
-    _save_notes(current_user.user_id, filtered)
+    await _persist_notes(current_user.user_id, filtered)
     return {"status": "deleted", "id": note_id, "deleted_count": len(to_delete)}
 
 
 # ----- Scheduled Jobs API -----
 @app.get("/api/scheduled-jobs")
-async def list_scheduled_jobs(current_user: AuthUser = Depends(get_current_user)) -> list[dict[str, Any]]:
+async def list_scheduled_jobs(current_user: AuthUser = Depends(require_full_account)) -> list[dict[str, Any]]:
     jobs = await _list_scheduled_jobs_merged(current_user.user_id)
     jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
     return [_enrich_scheduled_job(j) for j in jobs]
@@ -1633,7 +1943,7 @@ async def list_scheduled_jobs(current_user: AuthUser = Depends(get_current_user)
 @app.post("/api/scheduled-jobs")
 async def create_scheduled_job(
     request: ScheduledJobCreateRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(require_full_account),
 ) -> dict[str, Any]:
     if (request.schedule_type or "").lower() == "cron" and not (request.cron_expr or "").strip():
         raise HTTPException(status_code=400, detail="cron_expr required for cron schedule")
@@ -1697,7 +2007,7 @@ async def run_scheduled_job_now(
 @app.get("/api/scheduled-jobs/{job_id}")
 async def get_scheduled_job(
     job_id: str,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(require_full_account),
 ) -> dict[str, Any]:
     job = None
     if _use_supabase_store():
@@ -1713,7 +2023,7 @@ async def get_scheduled_job(
 async def update_scheduled_job(
     job_id: str,
     request: ScheduledJobUpdateRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(require_full_account),
 ) -> dict[str, Any]:
     job = None
     if _use_supabase_store():
@@ -1750,7 +2060,7 @@ async def update_scheduled_job(
 @app.delete("/api/scheduled-jobs/{job_id}")
 async def delete_scheduled_job(
     job_id: str,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(require_full_account),
 ) -> dict[str, Any]:
     # Local file is source of truth for merged UI; remove first so OneDrive/local always updates.
     ok_local = _remove_job_from_local_store(job_id, current_user.user_id)
@@ -1769,11 +2079,104 @@ async def delete_scheduled_job(
     return {"status": "deleted", "id": job_id}
 
 
-# ----- Mail (Gmail) API - separate from Arc Reactor agents -----
-def _gmail_available() -> bool:
-    tok = BASE_DIR / "token.json"
-    creds = BASE_DIR / "credentials.json"
-    return creds.exists() and (tok.exists() or True)
+# ----- Mail (Gmail) API — per-user OAuth (credentials.json + stored refresh tokens) -----
+
+
+async def _require_user_gmail_service(user_id: str):
+    if not _gmail_oauth_client_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Gmail OAuth client missing: add credentials.json from Google Cloud (Web application type) "
+                "and set GMAIL_OAUTH_REDIRECT_URI to match an authorized redirect URI."
+            ),
+        )
+    service, _email = await _get_gmail_service_for_user(user_id)
+    if not service:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "GMAIL_NOT_LINKED",
+                "message": "Connect your Gmail account from the Mail tab (Connect Gmail).",
+            },
+        )
+    return service
+
+
+@app.get("/api/mail/status")
+async def mail_status(current_user: AuthUser = Depends(require_full_account)) -> dict[str, Any]:
+    if not _gmail_oauth_client_configured():
+        return {"gmail_configured": False, "linked": False, "google_email": None}
+    row = await _load_user_gmail_row(current_user.user_id)
+    linked = bool(row and row.get("credentials_json"))
+    return {
+        "gmail_configured": True,
+        "linked": linked,
+        "google_email": (row.get("google_email") if row else None),
+    }
+
+
+@app.post("/api/mail/oauth/begin")
+async def mail_oauth_begin(current_user: AuthUser = Depends(require_full_account)) -> dict[str, str]:
+    if not _gmail_oauth_client_configured():
+        raise HTTPException(status_code=503, detail="Gmail OAuth client missing (credentials.json).")
+    _prune_gmail_oauth_states()
+    st = secrets.token_urlsafe(32)
+    GMAIL_OAUTH_STATES[st] = (current_user.user_id, time.time() + 600.0)
+    from lib.gmail_oauth import create_oauth_flow
+
+    flow = create_oauth_flow(_gmail_oauth_redirect_uri())
+    authorization_url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        state=st,
+        include_granted_scopes="true",
+    )
+    return {"authorization_url": authorization_url}
+
+
+@app.get("/api/mail/oauth/callback")
+async def mail_oauth_callback(
+    code: str = "",
+    state: str = "",
+    error: str = "",
+) -> RedirectResponse:
+    ok_url = _mail_oauth_success_url()
+    base = ok_url.split("?", 1)[0]
+    err_prefix = f"{base}?mail_error="
+
+    def redir_err(msg: str) -> RedirectResponse:
+        return RedirectResponse(err_prefix + urllib.parse.quote(msg, safe=""))
+
+    if error:
+        return redir_err(error)
+    if not code or not state:
+        return redir_err("missing_oauth_params")
+    _prune_gmail_oauth_states()
+    packed = GMAIL_OAUTH_STATES.pop(state, None)
+    if not packed:
+        return redir_err("invalid_or_expired_state")
+    user_id, exp_at = packed
+    if time.time() > exp_at:
+        return redir_err("oauth_state_expired")
+    try:
+        from lib.gmail_oauth import create_oauth_flow, credentials_to_storable_dict, fetch_google_email
+
+        flow = create_oauth_flow(_gmail_oauth_redirect_uri())
+        await asyncio.to_thread(flow.fetch_token, code=code)
+        creds = flow.credentials
+        store_dict = credentials_to_storable_dict(creds)
+        gemail = await asyncio.to_thread(fetch_google_email, creds)
+        await _save_user_gmail_credentials(user_id, gemail, store_dict)
+    except Exception as exc:
+        return redir_err(str(exc)[:220])
+    return RedirectResponse(ok_url, status_code=302)
+
+
+@app.delete("/api/mail/link")
+async def mail_unlink(current_user: AuthUser = Depends(require_full_account)) -> dict[str, str]:
+    await _delete_user_gmail_credentials_store(current_user.user_id)
+    return {"status": "unlinked"}
 
 
 @app.get("/api/mail/messages")
@@ -1781,14 +2184,13 @@ async def mail_list(
     max_results: int = 20,
     q: str = "",
     page_token: str | None = None,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(require_full_account),
 ) -> dict[str, Any]:
     """List Gmail threads (conversations) with pagination. Returns {threads, nextPageToken}."""
-    if not _gmail_available():
-        raise HTTPException(status_code=503, detail="Gmail not configured. Add credentials.json and run generate_gmail_token.py")
     try:
-        from lib.gmail_api import get_gmail_service, list_threads
-        service = get_gmail_service()
+        from lib.gmail_api import list_threads
+
+        service = await _require_user_gmail_service(current_user.user_id)
         threads, next_tok = await asyncio.to_thread(
             list_threads,
             service,
@@ -1797,6 +2199,8 @@ async def mail_list(
             page_token=page_token,
         )
         return {"threads": threads, "nextPageToken": next_tok}
+    except HTTPException:
+        raise
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -1806,16 +2210,17 @@ async def mail_list(
 @app.get("/api/mail/messages/{message_id}")
 async def mail_get(
     message_id: str,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(require_full_account),
 ) -> dict[str, Any]:
     """Get full email by ID."""
-    if not _gmail_available():
-        raise HTTPException(status_code=503, detail="Gmail not configured")
     try:
-        from lib.gmail_api import get_gmail_service, get_message
-        service = get_gmail_service()
+        from lib.gmail_api import get_message
+
+        service = await _require_user_gmail_service(current_user.user_id)
         msg = await asyncio.to_thread(get_message, service, message_id)
         return msg
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1823,16 +2228,17 @@ async def mail_get(
 @app.post("/api/mail/send")
 async def mail_send(
     req: MailSendRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(require_full_account),
 ) -> dict[str, Any]:
     """Send a new email."""
-    if not _gmail_available():
-        raise HTTPException(status_code=503, detail="Gmail not configured")
     try:
-        from lib.gmail_api import get_gmail_service, send_message
-        service = get_gmail_service()
+        from lib.gmail_api import send_message
+
+        service = await _require_user_gmail_service(current_user.user_id)
         sent = await asyncio.to_thread(send_message, service, to=req.to, subject=req.subject, body=req.body)
         return {"status": "sent", "id": sent.get("id")}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1840,16 +2246,17 @@ async def mail_send(
 @app.post("/api/mail/reply")
 async def mail_reply(
     req: MailReplyRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(require_full_account),
 ) -> dict[str, Any]:
     """Reply to an existing email."""
-    if not _gmail_available():
-        raise HTTPException(status_code=503, detail="Gmail not configured")
     try:
-        from lib.gmail_api import get_gmail_service, reply_to_message
-        service = get_gmail_service()
+        from lib.gmail_api import reply_to_message
+
+        service = await _require_user_gmail_service(current_user.user_id)
         sent = await asyncio.to_thread(reply_to_message, service, original_id=req.message_id, body=req.body)
         return {"status": "sent", "id": sent.get("id")}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1857,18 +2264,17 @@ async def mail_reply(
 @app.post("/api/mail/draft-with-ai")
 async def mail_draft_with_ai(
     req: MailDraftRequest,
-    current_user: AuthUser = Depends(get_current_user),
+    current_user: AuthUser = Depends(require_full_account),
 ) -> dict[str, Any]:
     """Generate an AI draft reply for an email. Returns { draft: string }."""
-    if not _gmail_available():
-        raise HTTPException(status_code=503, detail="Gmail not configured")
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="GEMINI_API_KEY required for AI draft")
     try:
-        from lib.gmail_api import get_gmail_service, get_message
+        from lib.gmail_api import get_message
         from google import genai
-        service = get_gmail_service()
+
+        service = await _require_user_gmail_service(current_user.user_id)
         msg = await asyncio.to_thread(get_message, service, req.message_id)
         from_addr = msg.get("from", "")
         subject = msg.get("subject", "")
@@ -1899,6 +2305,8 @@ Write only the reply body (plain text, no subject/headers). Keep it brief and ac
                     if draft:
                         break
         return {"draft": draft}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2193,10 +2601,10 @@ async def submit_formatter_followup(
         snapshot["status"] = "running"
         _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
         run_record = _build_run_record(run_id)
-        if run_record and _use_supabase_store():
+        if run_record and _cloud_persist_runs(current_user.user_id):
             await RUN_STORE.upsert_run(run_record)
 
-    if _use_supabase_store():
+    if _cloud_persist_runs(current_user.user_id):
         await RUN_STORE.insert_log(
             level="INFO",
             event_type="run_followup_created",
@@ -2292,6 +2700,23 @@ async def create_run(
     request: RunCreateRequest,
     current_user: AuthUser = Depends(get_current_user),
 ) -> RunCreateResponse:
+    if current_user.is_guest:
+        gsk = guest_session_key(current_user.user_id)
+        if not gsk:
+            raise HTTPException(status_code=401, detail="Invalid guest session")
+        try:
+            await guest_try_consume_run(gsk, guest_run_limit())
+        except ValueError:
+            lim = guest_run_limit()
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "GUEST_RUN_LIMIT",
+                    "message": f"You have used all {lim} free guest runs. Sign in with Google to continue.",
+                    "runs_limit": lim,
+                },
+            ) from None
+
     run_id = f"run_{uuid4().hex[:10]}"
     RUNS[run_id] = {
         "query": request.query,
@@ -2324,12 +2749,12 @@ async def create_run(
         "pending_clarification": None,
     }
     _save_local_run_record(run_id)
-    if _use_supabase_store():
+    if _cloud_persist_runs(current_user.user_id):
         await RUN_STORE.upsert_user(current_user.user_id, current_user.email)
     run_record = _build_run_record(run_id)
-    if run_record and _use_supabase_store():
+    if run_record and _cloud_persist_runs(current_user.user_id):
         await RUN_STORE.upsert_run(run_record)
-    if _use_supabase_store():
+    if _cloud_persist_runs(current_user.user_id):
         await RUN_STORE.insert_log(
             level="INFO",
             event_type="run_created",

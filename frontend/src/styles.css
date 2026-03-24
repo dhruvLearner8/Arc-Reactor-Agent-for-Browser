@@ -885,6 +885,71 @@ a {
   gap: 8px;
 }
 
+.top-nav-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.top-nav-guest-pill {
+  font-size: 12px;
+  color: #94a3b8;
+  border: 1px solid #334155;
+  border-radius: 999px;
+  padding: 4px 10px;
+  max-width: min(320px, 50vw);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.guest-signin-gate-panel {
+  grid-column: 2 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 280px;
+  padding: 24px;
+}
+
+.guest-signin-gate-card {
+  max-width: 420px;
+  padding: 24px;
+  border-radius: 12px;
+  border: 1px solid #334155;
+  background: #0f172a;
+}
+
+.guest-signin-gate-card h2 {
+  margin: 0 0 12px;
+  font-size: 18px;
+  color: #e2e8f0;
+}
+
+.guest-signin-gate-card p {
+  margin: 0 0 16px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #94a3b8;
+}
+
+.guest-signin-gate-link {
+  display: inline-block;
+  padding: 10px 16px;
+  font-size: 14px;
+  border-radius: 8px;
+  border: 1px solid #38bdf8;
+  background: #082f49;
+  color: #38bdf8;
+  text-decoration: none;
+}
+
+.guest-signin-gate-link:hover {
+  background: #0c4a6e;
+}
+
 .brand-title {
   font-size: 16px;
   font-weight: 700;
@@ -1714,13 +1779,92 @@ a {
 }
 
 .mail-panel-header-bar {
-  height: 44px;
+  min-height: 44px;
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 0 16px;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 8px 16px;
   border-bottom: 1px solid #374151;
   background: #1f2937;
+}
+
+.mail-linked-email {
+  font-size: 12px;
+  color: #86efac;
+  max-width: min(220px, 40vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mail-disconnect-btn {
+  padding: 6px 10px;
+  font-size: 11px;
+  border: 1px solid #64748b;
+  border-radius: 6px;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+}
+
+.mail-disconnect-btn:hover {
+  border-color: #f87171;
+  color: #fca5a5;
+}
+
+.mail-connect-panel {
+  padding: 32px 24px;
+  max-width: 520px;
+  margin: 0 auto;
+}
+
+.mail-connect-panel h2 {
+  margin: 0 0 12px;
+  font-size: 18px;
+  color: #e2e8f0;
+}
+
+.mail-connect-panel p {
+  margin: 0 0 12px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #94a3b8;
+}
+
+.mail-connect-panel code {
+  font-size: 12px;
+  color: #cbd5e1;
+}
+
+.mail-connect-hint {
+  margin: 0;
+  font-size: 14px;
+  color: #94a3b8;
+}
+
+.mail-connect-btn {
+  margin-top: 8px;
+  padding: 10px 18px;
+  font-size: 14px;
+  border-radius: 8px;
+  border: 1px solid #38bdf8;
+  background: #082f49;
+  color: #38bdf8;
+  cursor: pointer;
+}
+
+.mail-connect-btn:hover:not(:disabled) {
+  background: #0c4a6e;
+}
+
+.mail-connect-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.mail-error-connect {
+  margin-top: 12px;
 }
 
 .mail-panel-title {
@@ -2223,6 +2367,33 @@ a {
 
 .theme-light .mail-panel-title {
   color: #0f172a;
+}
+
+.theme-light .mail-linked-email {
+  color: #15803d;
+}
+
+.theme-light .mail-disconnect-btn {
+  border-color: #cbd5e1;
+  color: #64748b;
+}
+
+.theme-light .mail-disconnect-btn:hover {
+  border-color: #ef4444;
+  color: #dc2626;
+}
+
+.theme-light .mail-connect-panel h2 {
+  color: #0f172a;
+}
+
+.theme-light .mail-connect-panel p,
+.theme-light .mail-connect-hint {
+  color: #64748b;
+}
+
+.theme-light .mail-connect-panel code {
+  color: #334155;
 }
 
 .theme-light .mail-list-item {
@@ -2732,6 +2903,24 @@ button:disabled {
   color: #0f172a;
 }
 
+.theme-light .top-nav-guest-pill {
+  color: #64748b;
+  border-color: #cbd5e1;
+}
+
+.theme-light .guest-signin-gate-card {
+  background: #ffffff;
+  border-color: #e2e8f0;
+}
+
+.theme-light .guest-signin-gate-card h2 {
+  color: #0f172a;
+}
+
+.theme-light .guest-signin-gate-card p {
+  color: #64748b;
+}
+
 .theme-light .top-nav {
   border-bottom-color: #cbd5e1;
   background: #f8fafc;
@@ -3164,6 +3353,38 @@ button:disabled {
 .login-card p {
   margin: 0;
   color: #cbd5e1;
+}
+
+.login-card > button {
+  padding: 10px 16px;
+  font-size: 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid #38bdf8;
+  background: #082f49;
+  color: #38bdf8;
+}
+
+.login-card > button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.login-guest-btn {
+  border-color: #64748b !important;
+  background: transparent !important;
+  color: #e2e8f0 !important;
+}
+
+.login-guest-btn:hover:not(:disabled) {
+  border-color: #94a3b8 !important;
+  background: #1e293b !important;
+}
+
+.login-guest-hint {
+  font-size: 12px !important;
+  color: #94a3b8 !important;
+  line-height: 1.45 !important;
 }
 
 .page-loading {
