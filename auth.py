@@ -21,6 +21,7 @@ logger = logging.getLogger("auth")
 class AuthUser(BaseModel):
     user_id: str
     email: str | None = None
+    is_guest: bool = False
 
 
 _bearer = HTTPBearer(auto_error=False)
@@ -159,5 +160,32 @@ async def verify_access_token(token: str) -> AuthUser:
             detail="Token missing subject",
         )
 
-    logger.info("[AUTH] Authenticated user=%s (fp=%s)", user_id, token_fingerprint)
-    return AuthUser(user_id=user_id, email=payload.get("email"))
+    is_guest = isinstance(user_id, str) and user_id.startswith("guest:")
+    logger.info("[AUTH] Authenticated user=%s guest=%s (fp=%s)", user_id, is_guest, token_fingerprint)
+    return AuthUser(user_id=user_id, email=payload.get("email"), is_guest=is_guest)
+
+
+def guest_session_key(user_id: str) -> str | None:
+    if not isinstance(user_id, str) or not user_id.startswith("guest:"):
+        return None
+    return user_id.removeprefix("guest:")
+
+
+def mint_guest_access_token(guest_session_id: str) -> str:
+    """Issue HS256 JWT compatible with verify_access_token (needs SUPABASE_JWT_SECRET)."""
+    jwt_secret = (os.getenv("SUPABASE_JWT_SECRET") or "").strip().strip('"').strip("'")
+    if not jwt_secret:
+        raise RuntimeError("SUPABASE_JWT_SECRET is required to mint guest tokens")
+
+    now = int(time.time())
+    exp = now + 60 * 60 * 24 * 30  # 30 days
+    sub = f"guest:{guest_session_id}"
+    payload: dict[str, Any] = {
+        "sub": sub,
+        "role": "authenticated",
+        "iat": now,
+        "exp": exp,
+        "aud": _get_audience(),
+        "iss": _get_issuer(),
+    }
+    return jwt.encode(payload, jwt_secret, algorithm="HS256")

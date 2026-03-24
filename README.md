@@ -1,18 +1,9 @@
 # Arc Reactor - Multi-Agent DAG Architecture
 
-<p align="center">
-  <img src="./assets/arc-reactor-hero.png" alt="Arc Reactor Agent Hero Banner" width="860" />
-</p>
-
 Arc Reactor is a production-oriented multi-agent system built around a directed acyclic graph (DAG) execution model.  
 It combines a FastAPI backend, a React/ReactFlow frontend, MCP tool servers, and session-aware persistence for replayable run histories.
 
 This README documents the **current architecture** , with emphasis on how planning, execution, streaming, and storage work together.
-
----
-# Live
-
-https://www.arc-reactor.app
 
 ---
 # Demo - 1
@@ -35,8 +26,8 @@ https://youtu.be/wYQjWFYDFOg
 - [API Endpoints](#api-endpoints)
 - [Configuration](#configuration)
 - [Run Locally](#run-locally)
+- [Render + Supabase Setup](#render--supabase-setup)
 - [Project Structure](#project-structure)
-- [Report a Bug / Request a Feature](#report-a-bug--request-a-feature)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -341,6 +332,14 @@ Open `http://localhost:5173`.
 
 ---
 
+## Render + Supabase Setup
+
+For a hybrid setup (local frontend + Render backend + Supabase persistence), follow:
+
+- `docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md`
+
+---
+
 ## Project Structure
 
 ```text
@@ -358,24 +357,6 @@ S8 Share/
 ├── auth.py                 # JWT auth for API
 └── app.py                  # CLI/dev entry path
 ```
-
----
-
-## Report a Bug / Request a Feature
-
-If you find an issue in production or while testing, please open a GitHub issue:
-
-- Bug report: `https://github.com/dhruvLearner8/Arc-Reactor-Agent-for-Browser/issues/new?template=bug_report.yml`
-- Feature request: `https://github.com/dhruvLearner8/Arc-Reactor-Agent-for-Browser/issues/new?template=feature_request.yml`
-- All issues: `https://github.com/dhruvLearner8/Arc-Reactor-Agent-for-Browser/issues`
-
-For faster triage, include:
-
-- exact query used
-- expected vs actual behavior
-- reproduction steps
-- browser/devices details
-- screenshots or logs (when available)
 
 ---
 

@@ -36,7 +36,9 @@ function RequireAuth({ children }) {
   }, []);
 
   if (loading) return <div className="page-loading">Loading...</div>;
-  if (!session) return <Navigate to="/login" replace />;
+  const guestToken =
+    typeof localStorage !== "undefined" ? localStorage.getItem("arc_guest_token") : null;
+  if (!session?.access_token && !guestToken) return <Navigate to="/login" replace />;
   return children;
 }
 

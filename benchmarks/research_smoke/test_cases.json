@@ -1,0 +1,22 @@
+[
+  {
+    "id": "RS001",
+    "query": "Compare Asana, Monday.com, and ClickUp for a 50-person marketing agency with pricing and integration considerations.",
+    "expect_keywords": ["pricing", "integration", "recommendation"]
+  },
+  {
+    "id": "RS002",
+    "query": "Find current market size estimates for AI coding assistants and include source-backed numbers.",
+    "expect_keywords": ["source", "market", "estimate"]
+  },
+  {
+    "id": "RS003",
+    "query": "Research top 5 Ryokans in Kyoto with approximate nightly pricing and notable amenities.",
+    "expect_keywords": ["kyoto", "price", "amenities"]
+  },
+  {
+    "id": "RS004",
+    "query": "Compare Google Vertex AI, AWS Bedrock, and Azure OpenAI for enterprise deployment governance.",
+    "expect_keywords": ["governance", "enterprise", "comparison"]
+  }
+]

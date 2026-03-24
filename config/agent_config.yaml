@@ -21,8 +21,8 @@ agents:
   RetrieverAgent:
     prompt_file: "prompts/retriever.md"
     model: "gemini"
-    mcp_servers: ["rag", "browser"]
-    description: "Searches local documents and web."
+    mcp_servers: ["rag", "browser", "weather"]
+    description: "Searches local documents and web; live weather via Open-Meteo tool."
 
   SummarizerAgent:
     prompt_file: "prompts/summarizer.md"

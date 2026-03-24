@@ -1,27 +1,39 @@
 import asyncio
 import json
 import os
+import secrets
 import time
+import urllib.parse
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-from auth import AuthUser, get_current_user
+from auth import AuthUser, get_current_user, guest_session_key, mint_guest_access_token
+from guest_quota import guest_run_limit, guest_runs_used, guest_try_consume_run
+from agents.base_agent import AgentRunner
 from core.loop import AgentLoop4
 from mcp_servers.multi_mcp import MultiMCP
+
+from scheduler_service import build_query
 
 
 BASE_DIR = Path(__file__).parent
 SESSIONS_DIR = BASE_DIR / "memory" / "session_summaries_index"
+LOCAL_RUNS_DIR = BASE_DIR / "memory" / "local_runs"
+LOCAL_SCHEDULED_JOBS_DIR = BASE_DIR / "memory" / "scheduled_jobs"
 load_dotenv(BASE_DIR / ".env")
+LOCAL_RUN_STORE = (os.getenv("LOCAL_RUN_STORE") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class RunCreateRequest(BaseModel):
@@ -33,13 +45,103 @@ class ClarificationSubmitRequest(BaseModel):
     clarification_id: str | None = None
 
 
+class FormatterFollowupRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+
+
+class NoteCreateRequest(BaseModel):
+    content: str = Field(default="", max_length=100000)
+    name: str = Field(default="untitled.txt", min_length=1, max_length=200)
+    kind: str = Field(default="file")
+    parent_id: str | None = None
+
+
+class NoteUpdateRequest(BaseModel):
+    content: str | None = Field(default=None, max_length=100000)
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    kind: str | None = None
+    parent_id: str | None = None
+
+
 class RunCreateResponse(BaseModel):
     run_id: str
     status: str
     summary: dict[str, Any] = {}
 
 
-app = FastAPI(title="S15 NewArch API", version="0.1.0")
+class MailSendRequest(BaseModel):
+    to: str = Field(min_length=1)
+    subject: str = Field(default="")
+    body: str = Field(default="")
+
+
+class MailReplyRequest(BaseModel):
+    message_id: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+
+
+class MailDraftRequest(BaseModel):
+    message_id: str = Field(min_length=1)
+
+
+class ScheduledJobCreateRequest(BaseModel):
+    name: str = Field(default="Scheduled Job", min_length=1, max_length=200)
+    subject: str = Field(..., description="jobs | weather | stocks | news | custom")
+    params: dict[str, Any] = Field(default_factory=dict)
+    schedule_type: str = Field(..., description="cron | interval")
+    cron_expr: str | None = Field(default=None, description='e.g. "0 7 * * *" for 7am daily')
+    interval_minutes: int | None = Field(default=None, ge=1, le=10080)  # max 1 week
+
+
+class ScheduledJobUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    subject: str | None = None
+    params: dict[str, Any] | None = None
+    schedule_type: str | None = None
+    cron_expr: str | None = None
+    interval_minutes: int | None = Field(default=None, ge=1, le=10080)
+    enabled: bool | None = None
+
+
+class GuestAuthRequest(BaseModel):
+    """Stable browser id so quota survives token refresh; omit to start a new guest session."""
+
+    client_session_id: str | None = None
+
+
+class GuestAuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    guest_session_id: str
+    runs_used: int
+    runs_limit: int
+    runs_remaining: int
+
+
+JOB_SCHEDULER: AsyncIOScheduler | None = None
+
+
+def _scheduler_timezone() -> ZoneInfo:
+    tz_name = (os.getenv("SCHEDULER_TIMEZONE") or "America/Regina").strip()
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("America/Regina")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global JOB_SCHEDULER
+    JOB_SCHEDULER = AsyncIOScheduler(timezone=_scheduler_timezone())
+    JOB_SCHEDULER.start()
+    await _reload_scheduled_jobs()
+    yield
+    if JOB_SCHEDULER:
+        JOB_SCHEDULER.shutdown(wait=False)
+        JOB_SCHEDULER = None
+
+
+app = FastAPI(title="S15 NewArch API", version="0.1.0", lifespan=lifespan)
 
 cors_origins_env = os.getenv("CORS_ORIGINS", "")
 cors_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
@@ -201,6 +303,209 @@ class SupabaseRunStore:
             prefer="return=minimal",
         )
 
+    async def list_scheduled_jobs(self, user_id: str) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/scheduled_jobs",
+                params={
+                    "select": "id,owner_user_id,owner_email,name,subject,params,schedule_type,cron_expr,interval_minutes,enabled,created_at,updated_at,last_run_id,last_run_at",
+                    "owner_user_id": f"eq.{user_id}",
+                    "order": "created_at.desc",
+                },
+            )
+            return rows if isinstance(rows, list) else []
+        except Exception:
+            return []
+
+    async def get_scheduled_job(self, job_id: str, user_id: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/scheduled_jobs",
+                params={
+                    "select": "*",
+                    "id": f"eq.{job_id}",
+                    "owner_user_id": f"eq.{user_id}",
+                    "limit": "1",
+                },
+            )
+            return rows[0] if isinstance(rows, list) and rows else None
+        except Exception:
+            return None
+
+    async def upsert_scheduled_job(self, job: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        row: dict[str, Any] = {
+            "id": job["id"],
+            "owner_user_id": job["owner_user_id"],
+            "owner_email": job.get("owner_email"),
+            "name": job.get("name", "Scheduled Job"),
+            "subject": job.get("subject", "custom"),
+            "params": job.get("params", {}),
+            "schedule_type": job.get("schedule_type", "cron"),
+            "cron_expr": job.get("cron_expr"),
+            "interval_minutes": job.get("interval_minutes"),
+            "enabled": job.get("enabled", True),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        if job.get("last_run_id") is not None:
+            row["last_run_id"] = job.get("last_run_id")
+        if job.get("last_run_at") is not None:
+            row["last_run_at"] = job.get("last_run_at")
+        payload = [row]
+        try:
+            await self._request(
+                "POST",
+                "/rest/v1/scheduled_jobs",
+                params={"on_conflict": "id"},
+                payload=payload,
+                prefer="resolution=merge-duplicates,return=minimal",
+            )
+        except Exception as exc:
+            print(f"[scheduled_jobs] Supabase upsert failed: {exc}")
+
+    async def delete_scheduled_job(self, job_id: str, user_id: str) -> bool:
+        """Returns True only if Supabase reports at least one deleted row."""
+        if not self.enabled:
+            return False
+        try:
+            headers = dict(self._headers)
+            headers["Prefer"] = "return=representation"
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.delete(
+                    f"{self.url}/rest/v1/scheduled_jobs",
+                    params={"id": f"eq.{job_id}", "owner_user_id": f"eq.{user_id}"},
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                if not resp.content:
+                    return False
+                data = resp.json()
+                return isinstance(data, list) and len(data) > 0
+        except Exception as exc:
+            print(f"[scheduled_jobs] Supabase delete: {exc}")
+            return False
+
+    async def list_all_enabled_scheduled_jobs(self) -> list[dict[str, Any]]:
+        """All enabled jobs across users, for scheduler reload."""
+        if not self.enabled:
+            return []
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/scheduled_jobs",
+                params={
+                    "select": "id,owner_user_id,owner_email,name,subject,params,schedule_type,cron_expr,interval_minutes,enabled",
+                    "enabled": "eq.true",
+                    "order": "created_at.desc",
+                },
+            )
+            return rows if isinstance(rows, list) else []
+        except Exception:
+            return []
+
+    async def get_user_gmail_credentials(self, user_id: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/user_gmail_credentials",
+                params={
+                    "select": "google_email,credentials_json",
+                    "owner_user_id": f"eq.{user_id}",
+                    "limit": "1",
+                },
+            )
+            if isinstance(rows, list) and rows:
+                return rows[0]
+        except Exception as exc:
+            print(f"[gmail] get_user_gmail_credentials failed: {exc}")
+        return None
+
+    async def upsert_user_gmail_credentials(
+        self, user_id: str, google_email: str | None, credentials_json: dict[str, Any]
+    ) -> None:
+        if not self.enabled:
+            return
+        payload = [
+            {
+                "owner_user_id": user_id,
+                "google_email": google_email,
+                "credentials_json": credentials_json,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        ]
+        await self._request(
+            "POST",
+            "/rest/v1/user_gmail_credentials",
+            params={"on_conflict": "owner_user_id"},
+            payload=payload,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    async def delete_user_gmail_credentials(self, user_id: str) -> None:
+        if not self.enabled:
+            return
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.delete(
+                f"{self.url}/rest/v1/user_gmail_credentials",
+                params={"owner_user_id": f"eq.{user_id}"},
+                headers=self._headers,
+            )
+            resp.raise_for_status()
+
+    async def get_notepad_items(self, user_id: str) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/user_notepad",
+                params={
+                    "select": "items",
+                    "owner_user_id": f"eq.{user_id}",
+                    "limit": "1",
+                },
+            )
+            if not isinstance(rows, list) or not rows:
+                return []
+            raw = rows[0].get("items")
+            if raw is None:
+                return []
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            if not isinstance(raw, list):
+                return []
+            return [x for x in raw if isinstance(x, dict)]
+        except Exception as exc:
+            print(f"[notepad] get_notepad_items failed: {exc}")
+            return []
+
+    async def set_notepad_items(self, user_id: str, items: list[dict[str, Any]]) -> None:
+        if not self.enabled:
+            return
+        payload = [
+            {
+                "owner_user_id": user_id,
+                "items": items,
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+        ]
+        await self._request(
+            "POST",
+            "/rest/v1/user_notepad",
+            params={"on_conflict": "owner_user_id"},
+            payload=payload,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
     async def list_logs(self, limit: int = 500) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
@@ -218,10 +523,336 @@ class SupabaseRunStore:
 
 RUN_STORE = SupabaseRunStore()
 
+LOCAL_GMAIL_USERS_DIR = BASE_DIR / "memory" / "gmail_users"
+GMAIL_OAUTH_STATES: dict[str, tuple[str, float]] = {}
+
+
+def _local_gmail_cred_path(user_id: str) -> Path:
+    safe = user_id.replace("/", "_").replace("\\", "_")
+    LOCAL_GMAIL_USERS_DIR.mkdir(parents=True, exist_ok=True)
+    return LOCAL_GMAIL_USERS_DIR / f"{safe}.json"
+
+
+def _gmail_oauth_redirect_uri() -> str:
+    return (os.getenv("GMAIL_OAUTH_REDIRECT_URI") or "http://127.0.0.1:8000/api/mail/oauth/callback").strip()
+
+
+def _mail_oauth_success_url() -> str:
+    return (os.getenv("MAIL_OAUTH_SUCCESS_URL") or "http://127.0.0.1:5173/agent?mail_connected=1").strip()
+
+
+def _prune_gmail_oauth_states() -> None:
+    now = time.time()
+    for k, (_, exp) in list(GMAIL_OAUTH_STATES.items()):
+        if exp < now:
+            GMAIL_OAUTH_STATES.pop(k, None)
+
+
+def _gmail_oauth_client_configured() -> bool:
+    try:
+        from lib.gmail_oauth import gmail_credentials_file_exists
+
+        return gmail_credentials_file_exists()
+    except Exception:
+        return False
+
+
+async def _load_user_gmail_row(user_id: str) -> dict[str, Any] | None:
+    if RUN_STORE.enabled:
+        return await RUN_STORE.get_user_gmail_credentials(user_id)
+    p = _local_gmail_cred_path(user_id)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "credentials_json" in data:
+            return {"google_email": data.get("google_email"), "credentials_json": data["credentials_json"]}
+    except Exception:
+        return None
+    return None
+
+
+async def _save_user_gmail_credentials(user_id: str, google_email: str | None, creds_dict: dict[str, Any]) -> None:
+    if RUN_STORE.enabled:
+        await RUN_STORE.upsert_user_gmail_credentials(user_id, google_email, creds_dict)
+    else:
+        p = _local_gmail_cred_path(user_id)
+        p.write_text(
+            json.dumps({"google_email": google_email, "credentials_json": creds_dict}, indent=2),
+            encoding="utf-8",
+        )
+
+
+async def _delete_user_gmail_credentials_store(user_id: str) -> None:
+    if RUN_STORE.enabled:
+        try:
+            await RUN_STORE.delete_user_gmail_credentials(user_id)
+        except Exception:
+            pass
+    else:
+        p = _local_gmail_cred_path(user_id)
+        if p.exists():
+            p.unlink()
+
+
+async def _get_gmail_service_for_user(owner_user_id: str):
+    from lib.gmail_oauth import (
+        build_gmail_service,
+        credentials_from_stored_dict,
+        credentials_to_storable_dict,
+        refresh_credentials_if_needed,
+    )
+
+    row = await _load_user_gmail_row(owner_user_id)
+    if not row:
+        return None, None
+    raw = row.get("credentials_json")
+    if raw is None:
+        return None, None
+    if isinstance(raw, str):
+        try:
+            creds_dict = json.loads(raw)
+        except Exception:
+            return None, None
+    elif isinstance(raw, dict):
+        creds_dict = dict(raw)
+    else:
+        return None, None
+    if not creds_dict:
+        return None, None
+    creds = credentials_from_stored_dict(creds_dict)
+
+    def _refresh_work() -> dict[str, Any] | None:
+        if refresh_credentials_if_needed(creds):
+            return credentials_to_storable_dict(creds)
+        return None
+
+    updated = await asyncio.to_thread(_refresh_work)
+    if updated:
+        await _save_user_gmail_credentials(owner_user_id, row.get("google_email"), updated)
+        creds = credentials_from_stored_dict(updated)
+
+    return build_gmail_service(creds), row.get("google_email")
+
 
 def _load_session_file(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _local_run_path(run_id: str) -> Path:
+    LOCAL_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    return LOCAL_RUNS_DIR / f"{run_id}.json"
+
+
+def _notes_dir() -> Path:
+    path = BASE_DIR / "memory" / "notes"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _notes_path(user_id: str) -> Path:
+    safe_user = user_id.replace("/", "_")
+    return _notes_dir() / f"{safe_user}.json"
+
+
+def _load_notes(user_id: str) -> list[dict[str, Any]]:
+    path = _notes_path(user_id)
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def _save_notes(user_id: str, notes: list[dict[str, Any]]) -> None:
+    path = _notes_path(user_id)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(notes, f, ensure_ascii=False, indent=2)
+
+
+async def _notes_for_user(user_id: str) -> list[dict[str, Any]]:
+    if _use_supabase_store():
+        try:
+            cloud = await RUN_STORE.get_notepad_items(user_id)
+            return cloud
+        except Exception as exc:
+            print(f"[notepad] Supabase read failed, using local file: {exc}")
+    return _load_notes(user_id)
+
+
+async def _persist_notes(user_id: str, notes: list[dict[str, Any]]) -> None:
+    if _use_supabase_store():
+        await RUN_STORE.set_notepad_items(user_id, notes)
+    else:
+        _save_notes(user_id, notes)
+
+
+def _save_local_run_record(run_id: str) -> None:
+    run = RUNS.get(run_id)
+    if not run:
+        return
+    snapshot = run.get("snapshot") if isinstance(run.get("snapshot"), dict) else {}
+    payload = {
+        "run_id": run_id,
+        "owner_user_id": run.get("owner_user_id"),
+        "owner_email": run.get("owner_email"),
+        "query": run.get("query", ""),
+        "created_at": run.get("created_at"),
+        "status": run.get("status", "running"),
+        "session_id": run.get("session_id"),
+        "summary": run.get("summary", {}) if isinstance(run.get("summary"), dict) else {},
+        "latest_snapshot": snapshot,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    path = _local_run_path(run_id)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def _load_local_run_record(run_id: str) -> dict[str, Any] | None:
+    path = _local_run_path(run_id)
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _local_scheduled_jobs_path() -> Path:
+    LOCAL_SCHEDULED_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    return LOCAL_SCHEDULED_JOBS_DIR / "jobs.json"
+
+
+def _load_all_local_scheduled_jobs() -> list[dict[str, Any]]:
+    return [j for j in _load_local_scheduled_jobs_raw() if j.get("enabled", True)]
+
+
+def _save_local_scheduled_jobs(jobs: list[dict[str, Any]]) -> None:
+    path = _local_scheduled_jobs_path()
+    with path.open("w", encoding="utf-8") as f:
+        json.dump({"jobs": jobs}, f, ensure_ascii=False, indent=2)
+
+
+def _load_local_scheduled_jobs_raw() -> list[dict[str, Any]]:
+    """All jobs from local file (including disabled)."""
+    path = _local_scheduled_jobs_path()
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        jobs = data.get("jobs", data) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        return [j for j in jobs if isinstance(j, dict)]
+    except Exception:
+        return []
+
+
+def _upsert_job_in_local_store(job: dict[str, Any]) -> None:
+    """Always persist one job to memory/scheduled_jobs/jobs.json (survives missing Supabase table)."""
+    jobs = _load_local_scheduled_jobs_raw()
+    jid = job.get("id")
+    if not jid:
+        return
+    idx = next((i for i, j in enumerate(jobs) if j.get("id") == jid), None)
+    if idx is not None:
+        jobs[idx] = dict(job)
+    else:
+        jobs.insert(0, dict(job))
+    _save_local_scheduled_jobs(jobs)
+
+
+def _owner_ids_match(stored: Any, current: str) -> bool:
+    """JWT sub and JSON may differ only by case/spacing for UUIDs."""
+    a = str(stored or "").strip().lower()
+    b = str(current or "").strip().lower()
+    return bool(a) and a == b
+
+
+def _remove_job_from_local_store(job_id: str, owner_user_id: str) -> bool:
+    jobs = _load_local_scheduled_jobs_raw()
+    if not jobs:
+        return False
+    uid = str(owner_user_id)
+    # Match job_id as string (path params are always str)
+    new_jobs = [
+        j
+        for j in jobs
+        if not (str(j.get("id")) == str(job_id) and _owner_ids_match(j.get("owner_user_id"), uid))
+    ]
+    if len(new_jobs) == len(jobs):
+        return False
+    _save_local_scheduled_jobs(new_jobs)
+    return True
+
+
+async def _list_scheduled_jobs_merged(user_id: str) -> list[dict[str, Any]]:
+    """Supabase rows + local file, keyed by job id (local wins on conflict)."""
+    uid = str(user_id)
+    by_id: dict[str, dict[str, Any]] = {}
+    if _use_supabase_store():
+        try:
+            for j in await RUN_STORE.list_scheduled_jobs(user_id):
+                if isinstance(j, dict) and j.get("id"):
+                    by_id[str(j["id"])] = dict(j)
+        except Exception as exc:
+            print(f"[scheduled_jobs] Supabase list failed, using local only: {exc}")
+    for j in _load_local_scheduled_jobs_raw():
+        if not _owner_ids_match(j.get("owner_user_id"), uid):
+            continue
+        if j.get("id"):
+            by_id[str(j["id"])] = dict(j)
+    return list(by_id.values())
+
+
+async def _all_enabled_scheduled_jobs_merged() -> list[dict[str, Any]]:
+    """For APScheduler: every enabled job from cloud + local (local wins on id clash)."""
+    by_id: dict[str, dict[str, Any]] = {}
+    if _use_supabase_store():
+        try:
+            for j in await RUN_STORE.list_all_enabled_scheduled_jobs():
+                if isinstance(j, dict) and j.get("id"):
+                    by_id[str(j["id"])] = dict(j)
+        except Exception as exc:
+            print(f"[scheduled_jobs] list_all_enabled failed: {exc}")
+    for j in _load_all_local_scheduled_jobs():
+        if j.get("id"):
+            by_id[str(j["id"])] = dict(j)
+    return list(by_id.values())
+
+
+def _get_scheduled_job_from_local(job_id: str, owner_user_id: str) -> dict[str, Any] | None:
+    for j in _load_local_scheduled_jobs_raw():
+        if str(j.get("id")) == str(job_id) and _owner_ids_match(j.get("owner_user_id"), str(owner_user_id)):
+            return dict(j)
+    return None
+
+
+def _list_local_run_records(user_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    if not LOCAL_RUNS_DIR.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for path in LOCAL_RUNS_DIR.glob("run_*.json"):
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("owner_user_id") != user_id:
+                continue
+            rows.append(payload)
+        except Exception:
+            continue
+    rows.sort(key=lambda r: (r.get("created_at") or ""), reverse=True)
+    return rows[:limit]
 
 
 def _find_run_file(run_id: str) -> Path | None:
@@ -263,6 +894,29 @@ def _run_belongs_to_user(run: dict[str, Any] | None, user_id: str) -> bool:
         return False
     owner = run.get("owner_user_id")
     return bool(owner and owner == user_id)
+
+
+def _use_supabase_store() -> bool:
+    return (not LOCAL_RUN_STORE) and RUN_STORE.enabled
+
+
+def _cloud_persist_runs(owner_user_id: str) -> bool:
+    """Guests never sync runs to Supabase (avoids invalid FK / PII)."""
+    if isinstance(owner_user_id, str) and owner_user_id.startswith("guest:"):
+        return False
+    return _use_supabase_store()
+
+
+async def require_full_account(current_user: AuthUser = Depends(get_current_user)) -> AuthUser:
+    if current_user.is_guest:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "SIGN_IN_REQUIRED",
+                "message": "This feature requires signing in with Google.",
+            },
+        )
+    return current_user
 
 
 def _is_admin_user(user_id: str) -> bool:
@@ -372,6 +1026,273 @@ def _context_to_run_detail(context, status: str = "running") -> dict[str, Any]:
     }
 
 
+def _extract_best_formatter_text(output: Any) -> str:
+    if isinstance(output, str):
+        text = output.strip()
+        return text
+    if not isinstance(output, dict):
+        return ""
+
+    preferred_keys = ["formatted_report", "formatted_output", "final_answer", "summary", "fallback_markdown"]
+    for key in preferred_keys:
+        value = output.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    for key, value in output.items():
+        if not isinstance(key, str):
+            continue
+        if not isinstance(value, str):
+            continue
+        lower = key.lower()
+        if lower.startswith("formatted_report") and value.strip():
+            return value.strip()
+
+    for _, value in output.items():
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _last_formatter_node(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    nodes = snapshot.get("nodes", []) if isinstance(snapshot, dict) else []
+    for node in reversed(nodes):
+        if not isinstance(node, dict):
+            continue
+        agent = str(node.get("agent", "")).lower()
+        if "formatter" in agent:
+            return node
+    return None
+
+
+def _next_followup_step_ids(snapshot: dict[str, Any], count: int, prefix: str = "FUPR") -> list[str]:
+    nodes = snapshot.get("nodes", []) if isinstance(snapshot, dict) else []
+    existing = {str(node.get("id")) for node in nodes if isinstance(node, dict) and node.get("id")}
+    ids: list[str] = []
+    counter = 1
+    while len(ids) < count:
+        candidate = f"{prefix}{counter:03d}"
+        if candidate not in existing and candidate not in ids:
+            ids.append(candidate)
+        counter += 1
+    return ids
+
+
+def _build_research_followup_query(
+    *,
+    base_query: str,
+    followup_prompt: str,
+    previous_answer: str,
+) -> str:
+    return (
+        f"{base_query}\n\n"
+        "---- Previous answer context ----\n"
+        f"{previous_answer}\n\n"
+        "---- Follow-up request ----\n"
+        f"{followup_prompt}\n\n"
+        "Use the follow-up request to do additional research and provide an improved answer. "
+        "Do not merely rephrase; gather stronger evidence and deeper detail."
+    )
+
+
+def _coerce_output_value(output: Any, write_key: str) -> Any:
+    if isinstance(output, dict):
+        if write_key in output:
+            return output[write_key]
+        extracted = _extract_best_formatter_text(output)
+        if extracted:
+            return extracted
+        return output
+    if isinstance(output, str):
+        return output.strip()
+    return output
+
+
+async def _run_research_followup_in_run(
+    *,
+    run_id: str,
+    node_ids: dict[str, str],
+    read_keys: dict[str, str],
+    write_keys: dict[str, str],
+    followup_query: str,
+    owner_user_id: str | None,
+) -> None:
+    run = RUNS.get(run_id)
+    if not run:
+        return
+
+    multi_mcp = MultiMCP()
+    runner = AgentRunner(multi_mcp)
+    try:
+        await multi_mcp.start()
+        run = RUNS.get(run_id)
+        if not run:
+            return
+        snapshot = run.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise RuntimeError("Run snapshot unavailable for follow-up execution")
+        nodes = snapshot.get("nodes", [])
+        if not isinstance(nodes, list):
+            raise RuntimeError("Invalid node list in run snapshot")
+        globals_schema = snapshot.setdefault("globals_schema", {})
+        if not isinstance(globals_schema, dict):
+            raise RuntimeError("Invalid globals_schema in run snapshot")
+
+        async def execute_step(
+            step_id: str,
+            agent: str,
+            *,
+            reads: list[str],
+            writes: list[str],
+            agent_prompt: str,
+        ) -> dict[str, Any]:
+            node_ref = next((n for n in nodes if isinstance(n, dict) and n.get("id") == step_id), None)
+            if not isinstance(node_ref, dict):
+                raise RuntimeError(f"Follow-up node not found: {step_id}")
+
+            node_ref["status"] = "running"
+            node_ref["start_time"] = datetime.utcnow().isoformat()
+            run["status"] = "running"
+            snapshot["status"] = "running"
+            _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+
+            inputs = {key: globals_schema.get(key) for key in reads if key in globals_schema}
+            payload: dict[str, Any] = {
+                "step_id": step_id,
+                "agent_prompt": agent_prompt,
+                "reads": reads,
+                "writes": writes,
+                "inputs": inputs,
+            }
+            if agent == "FormatterAgent":
+                payload["all_globals_schema"] = dict(globals_schema)
+                payload["original_query"] = snapshot.get("query", run.get("query", ""))
+                payload["session_context"] = {
+                    "session_id": snapshot.get("session_id", run.get("session_id")),
+                    "created_at": snapshot.get("created_at", run.get("created_at")),
+                    "file_manifest": [],
+                }
+
+            result = await runner.run_agent(agent, payload)
+            if not result.get("success"):
+                raise RuntimeError(str(result.get("error") or f"{agent} failed"))
+            output = result.get("output", {}) or {}
+
+            for write_key in writes:
+                globals_schema[write_key] = _coerce_output_value(output, write_key)
+
+            node_ref["status"] = "completed"
+            node_ref["end_time"] = datetime.utcnow().isoformat()
+            node_ref["output"] = output
+            node_ref["error"] = None
+            _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+            return output if isinstance(output, dict) else {"output": output}
+
+        planner_output = await execute_step(
+            node_ids["planner"],
+            "PlannerAgent",
+            reads=[read_keys["previous_answer"], read_keys["followup_prompt"]],
+            writes=[write_keys["planner"]],
+            agent_prompt=(
+                "Create a focused follow-up research plan for this user request. "
+                "The plan should identify what facts to gather, what comparisons to make, and what answer structure to produce.\n\n"
+                f"Follow-up context query:\n{followup_query}"
+            ),
+        )
+        retriever_output = await execute_step(
+            node_ids["retriever"],
+            "RetrieverAgent",
+            reads=[read_keys["previous_answer"], read_keys["followup_prompt"], write_keys["planner"]],
+            writes=[write_keys["retriever"]],
+            agent_prompt=(
+                "Gather evidence and concrete data needed by the follow-up plan. "
+                "Prioritize current, source-backed details."
+            ),
+        )
+        thinker_output = await execute_step(
+            node_ids["thinker"],
+            "ThinkerAgent",
+            reads=[write_keys["planner"], write_keys["retriever"]],
+            writes=[write_keys["thinker"]],
+            agent_prompt="Reason over retrieved evidence and produce clear conclusions, trade-offs, and recommendations.",
+        )
+        await execute_step(
+            node_ids["distiller"],
+            "DistillerAgent",
+            reads=[write_keys["thinker"]],
+            writes=[write_keys["distiller"]],
+            agent_prompt="Distill follow-up analysis into concise, high-signal bullet points and structured themes.",
+        )
+        await execute_step(
+            node_ids["qa"],
+            "QAAgent",
+            reads=[write_keys["distiller"], write_keys["retriever"]],
+            writes=[write_keys["qa"]],
+            agent_prompt=(
+                "Validate follow-up answer quality for coverage, factual grounding, and clarity. "
+                "Return verdict and concrete issues if any."
+            ),
+        )
+        await execute_step(
+            node_ids["formatter"],
+            "FormatterAgent",
+            reads=[write_keys["planner"], write_keys["retriever"], write_keys["thinker"], write_keys["distiller"], write_keys["qa"]],
+            writes=[write_keys["formatter"]],
+            agent_prompt=(
+                "Produce a polished follow-up answer for the user. "
+                "Be practical, detailed, and directly aligned with the follow-up request."
+            ),
+        )
+
+        run["status"] = "completed"
+        snapshot["status"] = "completed"
+        run["error"] = None
+        _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+        _publish_event(run_id, {"status": "completed", "snapshot": snapshot}, event="run_complete")
+        run_record = _build_run_record(run_id)
+        ouid = owner_user_id or ""
+        if run_record and _cloud_persist_runs(ouid):
+            await RUN_STORE.upsert_run(run_record)
+        if _cloud_persist_runs(ouid):
+            await RUN_STORE.insert_log(
+                level="INFO",
+                event_type="run_followup_completed",
+                message="In-run research follow-up completed",
+                owner_user_id=owner_user_id,
+                run_id=run_id,
+                payload={"node_ids": node_ids, "retriever_keys": list(retriever_output.keys()), "thinker_keys": list(thinker_output.keys()), "planner_keys": list(planner_output.keys())},
+            )
+    except Exception as exc:
+        run = RUNS.get(run_id)
+        if run and isinstance(run.get("snapshot"), dict):
+            snapshot = run["snapshot"]
+            nodes = snapshot.get("nodes", [])
+            for sid in node_ids.values():
+                node_ref = next((n for n in nodes if isinstance(n, dict) and n.get("id") == sid), None)
+                if isinstance(node_ref, dict) and node_ref.get("status") in {"pending", "running"}:
+                    node_ref["status"] = "failed"
+                    node_ref["error"] = str(exc)
+                    node_ref["end_time"] = datetime.utcnow().isoformat()
+            run["status"] = "failed"
+            run["error"] = str(exc)
+            snapshot["status"] = "failed"
+            snapshot["error"] = str(exc)
+            _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+            _publish_event(run_id, {"status": "failed", "error": str(exc)}, event="run_error")
+        ouid = owner_user_id or ""
+        if _cloud_persist_runs(ouid):
+            await RUN_STORE.insert_log(
+                level="ERROR",
+                event_type="run_followup_failed",
+                message="In-run research follow-up failed",
+                owner_user_id=owner_user_id,
+                run_id=run_id,
+                payload={"error": str(exc), "node_ids": node_ids},
+            )
+    finally:
+        await multi_mcp.stop()
+
+
 def _serialize_sse(data: dict[str, Any], event: str = "message") -> str:
     payload = json.dumps(data, ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n"
@@ -386,6 +1307,7 @@ def _publish_event(run_id: str, payload: dict[str, Any], event: str = "message")
             payload["snapshot"]["activity"] = run.get("activity", [])[:50]
             payload["snapshot"]["pending_clarification"] = run.get("pending_clarification")
         run["snapshot"] = payload["snapshot"]
+        _save_local_run_record(run_id)
     subscribers = run.get("subscribers", set())
     for queue in list(subscribers):
         try:
@@ -417,9 +1339,189 @@ async def _watch_session_file(run_id: str, stop_event: asyncio.Event) -> None:
                 snapshot["status"] = run.get("status", snapshot.get("status", "running"))
                 _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
                 run_record = _build_run_record(run_id)
-                if run_record:
+                owner_uid = str(run.get("owner_user_id") or "")
+                if run_record and _cloud_persist_runs(owner_uid):
                     await RUN_STORE.upsert_run(run_record)
         await asyncio.sleep(0.6)
+
+
+def _enrich_scheduled_job(job: dict[str, Any]) -> dict[str, Any]:
+    out = dict(job)
+    out["built_query"] = build_query(job.get("subject", "custom"), job.get("params") or {})
+    return out
+
+
+async def _persist_scheduled_job_last_run(job_id: str, owner_user_id: str, run_id: str) -> None:
+    now_iso = datetime.utcnow().isoformat()
+    uid = str(owner_user_id)
+    jobs = _load_local_scheduled_jobs_raw()
+    for i, j in enumerate(jobs):
+        if j.get("id") == job_id and str(j.get("owner_user_id")) == uid:
+            jobs[i] = {**j, "last_run_id": run_id, "last_run_at": now_iso}
+            _save_local_scheduled_jobs(jobs)
+            break
+    if _use_supabase_store():
+        job = await RUN_STORE.get_scheduled_job(job_id, owner_user_id)
+        if job:
+            job = dict(job)
+            job["last_run_id"] = run_id
+            job["last_run_at"] = now_iso
+            try:
+                await RUN_STORE.upsert_scheduled_job(job)
+            except Exception as exc:
+                print(f"[scheduled_jobs] persist last_run cloud failed: {exc}")
+
+
+def _start_agent_run_for_scheduled_job(job: dict[str, Any]) -> tuple[str, str]:
+    """Create RUNS entry and spawn _execute_run. Returns (run_id, query)."""
+    job_id = job.get("id") or ""
+    owner_user_id = job.get("owner_user_id") or ""
+    owner_email = job.get("owner_email") or ""
+    query = build_query(job.get("subject", "custom"), job.get("params") or {})
+    if not query.strip():
+        raise ValueError("empty query for scheduled job")
+    run_id = f"run_{uuid4().hex[:10]}"
+    RUNS[run_id] = {
+        "query": query,
+        "created_at": datetime.utcnow().isoformat(),
+        "status": "queued",
+        "summary": {},
+        "snapshot": {
+            "run_id": run_id,
+            "query": query,
+            "status": "queued",
+            "nodes": [
+                {
+                    "id": "BOOTSTRAP_PLANNING",
+                    "agent": "PlannerAgent",
+                    "description": f"Scheduled: {job.get('name', job_id)}",
+                    "status": "running",
+                    "reads": [],
+                    "writes": [],
+                }
+            ],
+            "links": [],
+            "globals_schema": {},
+            "activity": [],
+        },
+        "subscribers": set(),
+        "session_id": None,
+        "owner_user_id": owner_user_id,
+        "owner_email": owner_email,
+        "activity": [],
+        "pending_clarification": None,
+        "scheduled_job_id": job_id,
+    }
+    _save_local_run_record(run_id)
+    asyncio.create_task(_execute_run(run_id, query, owner_user_id, owner_email))
+    return run_id, query
+
+
+async def _after_scheduled_run_started(
+    job: dict[str, Any],
+    run_id: str,
+    query: str,
+    *,
+    event_type: str = "scheduled_job_fired",
+    log_message: str = "Scheduled job executed",
+) -> None:
+    job_id = job.get("id") or ""
+    owner_user_id = job.get("owner_user_id") or ""
+    owner_email = job.get("owner_email") or ""
+    if _cloud_persist_runs(owner_user_id):
+        await RUN_STORE.upsert_user(owner_user_id, owner_email)
+    run_record = _build_run_record(run_id)
+    if run_record and _cloud_persist_runs(owner_user_id):
+        await RUN_STORE.upsert_run(run_record)
+    if _cloud_persist_runs(owner_user_id):
+        await RUN_STORE.insert_log(
+            level="INFO",
+            event_type=event_type,
+            message=log_message,
+            owner_user_id=owner_user_id,
+            run_id=run_id,
+            payload={"query": query, "scheduled_job_id": job_id},
+        )
+    await _persist_scheduled_job_last_run(job_id, owner_user_id, run_id)
+
+
+async def _on_scheduled_job_fire(job_id: str) -> None:
+    """Called by APScheduler when a scheduled job fires."""
+    jobs = await _all_enabled_scheduled_jobs_merged()
+    job = next((j for j in jobs if str(j.get("id")) == str(job_id)), None)
+    if not job:
+        print(f"[scheduler] job {job_id} not found, skipping")
+        return
+    try:
+        run_id, query = _start_agent_run_for_scheduled_job(job)
+    except ValueError as e:
+        print(f"[scheduler] job {job_id}: {e}")
+        return
+    await _after_scheduled_run_started(job, run_id, query)
+    print(f"[scheduler] job {job_id} started run {run_id}")
+
+
+async def _reload_scheduled_jobs() -> None:
+    """Load all enabled jobs and register with APScheduler."""
+    if not JOB_SCHEDULER:
+        return
+    for j in JOB_SCHEDULER.get_jobs():
+        try:
+            j.remove()
+        except Exception:
+            pass
+    jobs = await _all_enabled_scheduled_jobs_merged()
+    for job in jobs:
+        job_id = job.get("id")
+        if not job_id:
+            continue
+        schedule_type = (job.get("schedule_type") or "cron").lower()
+        try:
+            if schedule_type == "interval":
+                mins = job.get("interval_minutes") or 60
+                JOB_SCHEDULER.add_job(
+                    _on_scheduled_job_fire,
+                    "interval",
+                    minutes=mins,
+                    id=job_id,
+                    args=[job_id],
+                    replace_existing=True,
+                )
+            else:
+                cron = job.get("cron_expr") or "0 7 * * *"  # default 7am daily
+                JOB_SCHEDULER.add_job(
+                    _on_scheduled_job_fire,
+                    "cron",
+                    **{k: v for k, v in _cron_to_kwargs(cron).items() if v is not None},
+                    id=job_id,
+                    args=[job_id],
+                    replace_existing=True,
+                )
+        except Exception as e:
+            print(f"[scheduler] failed to add job {job_id}: {e}")
+
+
+def _cron_to_kwargs(cron_expr: str) -> dict[str, Any]:
+    """Convert cron 'min hour day month dow' to APScheduler cron trigger kwargs."""
+    parts = (cron_expr or "0 7 * * *").strip().split()
+    kwargs = {}
+    if len(parts) > 0:
+        kwargs["minute"] = int(parts[0]) if parts[0] != "*" else 0
+    if len(parts) > 1 and parts[1] != "*":
+        kwargs["hour"] = int(parts[1])
+    if len(parts) > 2 and parts[2] != "*":
+        try:
+            kwargs["day"] = int(parts[2])
+        except ValueError:
+            kwargs["day"] = parts[2]
+    if len(parts) > 3 and parts[3] != "*":
+        try:
+            kwargs["month"] = int(parts[3])
+        except ValueError:
+            kwargs["month"] = parts[3]
+    if len(parts) > 4 and parts[4] != "*":
+        kwargs["day_of_week"] = parts[4]
+    return kwargs
 
 
 async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email: str | None) -> None:
@@ -427,17 +1529,19 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
     stop_event = asyncio.Event()
     watcher_task = None
     RUNS[run_id]["status"] = "starting"
+    _save_local_run_record(run_id)
     run_record = _build_run_record(run_id)
-    if run_record:
+    if run_record and _cloud_persist_runs(owner_user_id):
         await RUN_STORE.upsert_run(run_record)
-    await RUN_STORE.insert_log(
-        level="INFO",
-        event_type="run_started",
-        message="Run execution started",
-        owner_user_id=owner_user_id,
-        run_id=run_id,
-        payload={"query": query},
-    )
+    if _cloud_persist_runs(owner_user_id):
+        await RUN_STORE.insert_log(
+            level="INFO",
+            event_type="run_started",
+            message="Run execution started",
+            owner_user_id=owner_user_id,
+            run_id=run_id,
+            payload={"query": query},
+        )
 
     try:
         print(f"[run:{run_id}] execution_bootstrap_started")
@@ -470,7 +1574,7 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 return
             run["last_progress_persist_at"] = now
             run_record = _build_run_record(run_id)
-            if run_record and _use_supabase_store():
+            if run_record and _cloud_persist_runs(owner_user_id):
                 await RUN_STORE.upsert_run(run_record)
 
         async def on_clarification(step_id: str, output: dict[str, Any]) -> str:
@@ -562,7 +1666,7 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 bootstrap_snapshot["pending_clarification"] = RUNS[run_id].get("pending_clarification")
                 _publish_event(run_id, {"snapshot": bootstrap_snapshot}, event="run_update")
                 run_record = _build_run_record(run_id)
-                if run_record:
+                if run_record and _cloud_persist_runs(owner_user_id):
                     await RUN_STORE.upsert_run(run_record)
                 break
             if run_task.done():
@@ -593,6 +1697,7 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
         RUNS[run_id]["session_id"] = session_id
         RUNS[run_id]["status"] = "completed"
         RUNS[run_id]["summary"] = summary
+        _save_local_run_record(run_id)
 
         final_snapshot = _context_to_run_detail(context, status="completed")
         final_snapshot["run_id"] = run_id
@@ -604,48 +1709,53 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
             {"status": "completed", "summary": summary, "snapshot": final_snapshot},
             event="run_complete",
         )
-        await RUN_STORE.insert_log(
-            level="INFO",
-            event_type="run_completed",
-            message="Run execution completed",
-            owner_user_id=owner_user_id,
-            run_id=run_id,
-            payload={"session_id": session_id, "status": "completed"},
-        )
+        if _cloud_persist_runs(owner_user_id):
+            await RUN_STORE.insert_log(
+                level="INFO",
+                event_type="run_completed",
+                message="Run execution completed",
+                owner_user_id=owner_user_id,
+                run_id=run_id,
+                payload={"session_id": session_id, "status": "completed"},
+            )
         run_record = _build_run_record(run_id)
-        if run_record:
+        if run_record and _cloud_persist_runs(owner_user_id):
             await RUN_STORE.upsert_run(run_record)
     except asyncio.TimeoutError:
         RUNS[run_id]["status"] = "failed"
         timeout_sec = int((os.getenv("RUN_TIMEOUT_SEC") or "900").strip())
         err_msg = f"Run timed out after {timeout_sec}s"
         RUNS[run_id]["error"] = err_msg
+        _save_local_run_record(run_id)
         _publish_event(run_id, {"status": "failed", "error": err_msg}, event="run_error")
-        await RUN_STORE.insert_log(
-            level="ERROR",
-            event_type="run_failed",
-            message="Run execution timed out",
-            owner_user_id=owner_user_id,
-            run_id=run_id,
-            payload={"error": err_msg, "timeout_sec": timeout_sec},
-        )
+        if _cloud_persist_runs(owner_user_id):
+            await RUN_STORE.insert_log(
+                level="ERROR",
+                event_type="run_failed",
+                message="Run execution timed out",
+                owner_user_id=owner_user_id,
+                run_id=run_id,
+                payload={"error": err_msg, "timeout_sec": timeout_sec},
+            )
         run_record = _build_run_record(run_id)
-        if run_record:
+        if run_record and _cloud_persist_runs(owner_user_id):
             await RUN_STORE.upsert_run(run_record)
     except Exception as exc:
         RUNS[run_id]["status"] = "failed"
         RUNS[run_id]["error"] = str(exc)
+        _save_local_run_record(run_id)
         _publish_event(run_id, {"status": "failed", "error": str(exc)}, event="run_error")
-        await RUN_STORE.insert_log(
-            level="ERROR",
-            event_type="run_failed",
-            message="Run execution failed",
-            owner_user_id=owner_user_id,
-            run_id=run_id,
-            payload={"error": str(exc)},
-        )
+        if _cloud_persist_runs(owner_user_id):
+            await RUN_STORE.insert_log(
+                level="ERROR",
+                event_type="run_failed",
+                message="Run execution failed",
+                owner_user_id=owner_user_id,
+                run_id=run_id,
+                payload={"error": str(exc)},
+            )
         run_record = _build_run_record(run_id)
-        if run_record:
+        if run_record and _cloud_persist_runs(owner_user_id):
             await RUN_STORE.upsert_run(run_record)
     finally:
         stop_event.set()
@@ -663,9 +1773,542 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/auth/guest", response_model=GuestAuthResponse)
+async def auth_guest(body: GuestAuthRequest) -> GuestAuthResponse:
+    try:
+        if body.client_session_id:
+            sid = str(UUID(body.client_session_id))
+        else:
+            sid = str(uuid4())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid client_session_id") from None
+
+    try:
+        token = mint_guest_access_token(sid)
+    except RuntimeError:
+        raise HTTPException(
+            status_code=503,
+            detail="Guest sign-in is not configured. Set SUPABASE_JWT_SECRET on the server.",
+        ) from None
+
+    limit = guest_run_limit()
+    used = guest_runs_used(sid)
+    return GuestAuthResponse(
+        access_token=token,
+        guest_session_id=sid,
+        runs_used=used,
+        runs_limit=limit,
+        runs_remaining=max(0, limit - used),
+    )
+
+
 @app.get("/api/me")
 async def me(current_user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
-    return {"user_id": current_user.user_id, "email": current_user.email}
+    out: dict[str, Any] = {
+        "user_id": current_user.user_id,
+        "email": current_user.email,
+        "is_guest": current_user.is_guest,
+    }
+    if current_user.is_guest:
+        gsk = guest_session_key(current_user.user_id)
+        if gsk:
+            limit = guest_run_limit()
+            used = guest_runs_used(gsk)
+            out["runs_used"] = used
+            out["runs_limit"] = limit
+            out["runs_remaining"] = max(0, limit - used)
+    else:
+        out["runs_used"] = None
+        out["runs_limit"] = None
+        out["runs_remaining"] = None
+    return out
+
+
+@app.get("/api/notes")
+async def list_notes(current_user: AuthUser = Depends(get_current_user)) -> list[dict[str, Any]]:
+    notes = await _notes_for_user(current_user.user_id)
+    for note in notes:
+        note["kind"] = (note.get("kind") or "file").strip().lower()
+        note["name"] = (note.get("name") or "untitled.txt").strip() or "untitled.txt"
+        if "parent_id" not in note:
+            note["parent_id"] = None
+        if note["kind"] == "folder":
+            note["content"] = ""
+        else:
+            note["content"] = str(note.get("content") or "")
+    notes.sort(key=lambda n: (n.get("updated_at") or n.get("created_at") or ""), reverse=True)
+    return notes
+
+
+@app.post("/api/notes")
+async def create_note(
+    request: NoteCreateRequest, current_user: AuthUser = Depends(get_current_user)
+) -> dict[str, Any]:
+    notes = await _notes_for_user(current_user.user_id)
+    kind = (request.kind or "file").strip().lower()
+    if kind not in {"file", "folder"}:
+        raise HTTPException(status_code=400, detail="Invalid note kind")
+    name = (request.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    if kind == "file" and not name.lower().endswith(".md"):
+        name = f"{name}.md"
+    if request.parent_id:
+        parent = next((n for n in notes if n.get("id") == request.parent_id), None)
+        if not parent:
+            raise HTTPException(status_code=400, detail="Parent folder not found")
+        if (parent.get("kind") or "file").strip().lower() != "folder":
+            raise HTTPException(status_code=400, detail="Parent must be a folder")
+    now = datetime.utcnow().isoformat()
+    note = {
+        "id": f"note_{uuid4().hex[:10]}",
+        "name": name,
+        "kind": kind,
+        "parent_id": request.parent_id,
+        "content": "" if kind == "folder" else (request.content or ""),
+        "created_at": now,
+        "updated_at": now,
+    }
+    notes.insert(0, note)
+    await _persist_notes(current_user.user_id, notes)
+    return note
+
+
+@app.put("/api/notes/{note_id}")
+async def update_note(
+    note_id: str, request: NoteUpdateRequest, current_user: AuthUser = Depends(get_current_user)
+) -> dict[str, Any]:
+    notes = await _notes_for_user(current_user.user_id)
+    for note in notes:
+        if note.get("id") == note_id:
+            if request.name is not None:
+                name = request.name.strip()
+                if not name:
+                    raise HTTPException(status_code=400, detail="Name cannot be empty")
+                note["name"] = name
+            if request.kind is not None:
+                next_kind = request.kind.strip().lower()
+                if next_kind not in {"file", "folder"}:
+                    raise HTTPException(status_code=400, detail="Invalid note kind")
+                note["kind"] = next_kind
+                if next_kind == "folder":
+                    note["content"] = ""
+            if request.parent_id is not None:
+                if request.parent_id == note_id:
+                    raise HTTPException(status_code=400, detail="Cannot set item as its own parent")
+                parent = next((n for n in notes if n.get("id") == request.parent_id), None)
+                if not parent:
+                    raise HTTPException(status_code=400, detail="Parent folder not found")
+                if (parent.get("kind") or "file").strip().lower() != "folder":
+                    raise HTTPException(status_code=400, detail="Parent must be a folder")
+                note["parent_id"] = request.parent_id
+            if request.content is not None and (note.get("kind") or "file") != "folder":
+                note["content"] = request.content
+            note["updated_at"] = datetime.utcnow().isoformat()
+            await _persist_notes(current_user.user_id, notes)
+            return note
+    raise HTTPException(status_code=404, detail="Note not found")
+
+
+@app.delete("/api/notes/{note_id}")
+async def delete_note(note_id: str, current_user: AuthUser = Depends(get_current_user)) -> dict[str, Any]:
+    notes = await _notes_for_user(current_user.user_id)
+    note_ids = {n.get("id") for n in notes}
+    if note_id not in note_ids:
+        raise HTTPException(status_code=404, detail="Note not found")
+    to_delete = {note_id}
+    changed = True
+    while changed:
+        changed = False
+        for n in notes:
+            nid = n.get("id")
+            if nid in to_delete:
+                continue
+            if n.get("parent_id") in to_delete:
+                to_delete.add(nid)
+                changed = True
+    filtered = [n for n in notes if n.get("id") not in to_delete]
+    await _persist_notes(current_user.user_id, filtered)
+    return {"status": "deleted", "id": note_id, "deleted_count": len(to_delete)}
+
+
+# ----- Scheduled Jobs API -----
+@app.get("/api/scheduled-jobs")
+async def list_scheduled_jobs(current_user: AuthUser = Depends(require_full_account)) -> list[dict[str, Any]]:
+    jobs = await _list_scheduled_jobs_merged(current_user.user_id)
+    jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+    return [_enrich_scheduled_job(j) for j in jobs]
+
+
+@app.post("/api/scheduled-jobs")
+async def create_scheduled_job(
+    request: ScheduledJobCreateRequest,
+    current_user: AuthUser = Depends(require_full_account),
+) -> dict[str, Any]:
+    if (request.schedule_type or "").lower() == "cron" and not (request.cron_expr or "").strip():
+        raise HTTPException(status_code=400, detail="cron_expr required for cron schedule")
+    if (request.schedule_type or "").lower() == "interval" and not request.interval_minutes:
+        raise HTTPException(status_code=400, detail="interval_minutes required for interval schedule")
+    job_id = f"job_{uuid4().hex[:10]}"
+    job = {
+        "id": job_id,
+        "owner_user_id": current_user.user_id,
+        "owner_email": current_user.email,
+        "name": (request.name or "Scheduled Job").strip(),
+        "subject": (request.subject or "custom").strip().lower(),
+        "params": request.params or {},
+        "schedule_type": (request.schedule_type or "cron").strip().lower(),
+        "cron_expr": (request.cron_expr or "").strip() or None,
+        "interval_minutes": request.interval_minutes,
+        "enabled": True,
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    if _use_supabase_store():
+        try:
+            await RUN_STORE.upsert_scheduled_job(job)
+        except Exception as exc:
+            print(f"[scheduled_jobs] create cloud save failed (local still saved): {exc}")
+    _upsert_job_in_local_store(job)
+    await _reload_scheduled_jobs()
+    return _enrich_scheduled_job(job)
+
+
+@app.post("/api/scheduled-jobs/{job_id}/run-now")
+async def run_scheduled_job_now(
+    job_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Start the agent run for this job immediately (same query as scheduled / built_query)."""
+    job = None
+    if _use_supabase_store():
+        job = await RUN_STORE.get_scheduled_job(job_id, current_user.user_id)
+    if not job:
+        job = _get_scheduled_job_from_local(job_id, current_user.user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+    try:
+        run_id, query = _start_agent_run_for_scheduled_job(job)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    await _after_scheduled_run_started(
+        job,
+        run_id,
+        query,
+        event_type="scheduled_job_run_now",
+        log_message="Scheduled job run-now started",
+    )
+    job = dict(job)
+    job["last_run_id"] = run_id
+    job["last_run_at"] = datetime.utcnow().isoformat()
+    return {"run_id": run_id, "query": query, "job": _enrich_scheduled_job(job)}
+
+
+@app.get("/api/scheduled-jobs/{job_id}")
+async def get_scheduled_job(
+    job_id: str,
+    current_user: AuthUser = Depends(require_full_account),
+) -> dict[str, Any]:
+    job = None
+    if _use_supabase_store():
+        job = await RUN_STORE.get_scheduled_job(job_id, current_user.user_id)
+    if not job:
+        job = _get_scheduled_job_from_local(job_id, current_user.user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+    return _enrich_scheduled_job(job)
+
+
+@app.patch("/api/scheduled-jobs/{job_id}")
+async def update_scheduled_job(
+    job_id: str,
+    request: ScheduledJobUpdateRequest,
+    current_user: AuthUser = Depends(require_full_account),
+) -> dict[str, Any]:
+    job = None
+    if _use_supabase_store():
+        job = await RUN_STORE.get_scheduled_job(job_id, current_user.user_id)
+    if not job:
+        job = _get_scheduled_job_from_local(job_id, current_user.user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+    if request.name is not None:
+        job["name"] = request.name.strip()
+    if request.subject is not None:
+        job["subject"] = request.subject.strip().lower()
+    if request.params is not None:
+        job["params"] = request.params
+    if request.schedule_type is not None:
+        job["schedule_type"] = request.schedule_type.strip().lower()
+    if request.cron_expr is not None:
+        job["cron_expr"] = request.cron_expr.strip() or None
+    if request.interval_minutes is not None:
+        job["interval_minutes"] = request.interval_minutes
+    if request.enabled is not None:
+        job["enabled"] = request.enabled
+    job["updated_at"] = datetime.utcnow().isoformat()
+    if _use_supabase_store():
+        try:
+            await RUN_STORE.upsert_scheduled_job(job)
+        except Exception as exc:
+            print(f"[scheduled_jobs] patch cloud save failed (local still saved): {exc}")
+    _upsert_job_in_local_store(job)
+    await _reload_scheduled_jobs()
+    return _enrich_scheduled_job(job)
+
+
+@app.delete("/api/scheduled-jobs/{job_id}")
+async def delete_scheduled_job(
+    job_id: str,
+    current_user: AuthUser = Depends(require_full_account),
+) -> dict[str, Any]:
+    # Local file is source of truth for merged UI; remove first so OneDrive/local always updates.
+    ok_local = _remove_job_from_local_store(job_id, current_user.user_id)
+    if _use_supabase_store():
+        try:
+            await RUN_STORE.delete_scheduled_job(job_id, current_user.user_id)
+        except Exception as exc:
+            print(f"[scheduled_jobs] Supabase delete failed: {exc}")
+    if not ok_local:
+        merged = await _list_scheduled_jobs_merged(current_user.user_id)
+        if not any(str(j.get("id")) == str(job_id) for j in merged):
+            await _reload_scheduled_jobs()
+            return {"status": "deleted", "id": job_id}
+        raise HTTPException(status_code=404, detail="Scheduled job not found or access denied")
+    await _reload_scheduled_jobs()
+    return {"status": "deleted", "id": job_id}
+
+
+# ----- Mail (Gmail) API — per-user OAuth (credentials.json + stored refresh tokens) -----
+
+
+async def _require_user_gmail_service(user_id: str):
+    if not _gmail_oauth_client_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Gmail OAuth client missing: add credentials.json from Google Cloud (Web application type) "
+                "and set GMAIL_OAUTH_REDIRECT_URI to match an authorized redirect URI."
+            ),
+        )
+    service, _email = await _get_gmail_service_for_user(user_id)
+    if not service:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "GMAIL_NOT_LINKED",
+                "message": "Connect your Gmail account from the Mail tab (Connect Gmail).",
+            },
+        )
+    return service
+
+
+@app.get("/api/mail/status")
+async def mail_status(current_user: AuthUser = Depends(require_full_account)) -> dict[str, Any]:
+    if not _gmail_oauth_client_configured():
+        return {"gmail_configured": False, "linked": False, "google_email": None}
+    row = await _load_user_gmail_row(current_user.user_id)
+    linked = bool(row and row.get("credentials_json"))
+    return {
+        "gmail_configured": True,
+        "linked": linked,
+        "google_email": (row.get("google_email") if row else None),
+    }
+
+
+@app.post("/api/mail/oauth/begin")
+async def mail_oauth_begin(current_user: AuthUser = Depends(require_full_account)) -> dict[str, str]:
+    if not _gmail_oauth_client_configured():
+        raise HTTPException(status_code=503, detail="Gmail OAuth client missing (credentials.json).")
+    _prune_gmail_oauth_states()
+    st = secrets.token_urlsafe(32)
+    GMAIL_OAUTH_STATES[st] = (current_user.user_id, time.time() + 600.0)
+    from lib.gmail_oauth import create_oauth_flow
+
+    flow = create_oauth_flow(_gmail_oauth_redirect_uri())
+    authorization_url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        state=st,
+        include_granted_scopes="true",
+    )
+    return {"authorization_url": authorization_url}
+
+
+@app.get("/api/mail/oauth/callback")
+async def mail_oauth_callback(
+    code: str = "",
+    state: str = "",
+    error: str = "",
+) -> RedirectResponse:
+    ok_url = _mail_oauth_success_url()
+    base = ok_url.split("?", 1)[0]
+    err_prefix = f"{base}?mail_error="
+
+    def redir_err(msg: str) -> RedirectResponse:
+        return RedirectResponse(err_prefix + urllib.parse.quote(msg, safe=""))
+
+    if error:
+        return redir_err(error)
+    if not code or not state:
+        return redir_err("missing_oauth_params")
+    _prune_gmail_oauth_states()
+    packed = GMAIL_OAUTH_STATES.pop(state, None)
+    if not packed:
+        return redir_err("invalid_or_expired_state")
+    user_id, exp_at = packed
+    if time.time() > exp_at:
+        return redir_err("oauth_state_expired")
+    try:
+        from lib.gmail_oauth import create_oauth_flow, credentials_to_storable_dict, fetch_google_email
+
+        flow = create_oauth_flow(_gmail_oauth_redirect_uri())
+        await asyncio.to_thread(flow.fetch_token, code=code)
+        creds = flow.credentials
+        store_dict = credentials_to_storable_dict(creds)
+        gemail = await asyncio.to_thread(fetch_google_email, creds)
+        await _save_user_gmail_credentials(user_id, gemail, store_dict)
+    except Exception as exc:
+        return redir_err(str(exc)[:220])
+    return RedirectResponse(ok_url, status_code=302)
+
+
+@app.delete("/api/mail/link")
+async def mail_unlink(current_user: AuthUser = Depends(require_full_account)) -> dict[str, str]:
+    await _delete_user_gmail_credentials_store(current_user.user_id)
+    return {"status": "unlinked"}
+
+
+@app.get("/api/mail/messages")
+async def mail_list(
+    max_results: int = 20,
+    q: str = "",
+    page_token: str | None = None,
+    current_user: AuthUser = Depends(require_full_account),
+) -> dict[str, Any]:
+    """List Gmail threads (conversations) with pagination. Returns {threads, nextPageToken}."""
+    try:
+        from lib.gmail_api import list_threads
+
+        service = await _require_user_gmail_service(current_user.user_id)
+        threads, next_tok = await asyncio.to_thread(
+            list_threads,
+            service,
+            max_results=min(max_results, 50),
+            query=q,
+            page_token=page_token,
+        )
+        return {"threads": threads, "nextPageToken": next_tok}
+    except HTTPException:
+        raise
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/mail/messages/{message_id}")
+async def mail_get(
+    message_id: str,
+    current_user: AuthUser = Depends(require_full_account),
+) -> dict[str, Any]:
+    """Get full email by ID."""
+    try:
+        from lib.gmail_api import get_message
+
+        service = await _require_user_gmail_service(current_user.user_id)
+        msg = await asyncio.to_thread(get_message, service, message_id)
+        return msg
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mail/send")
+async def mail_send(
+    req: MailSendRequest,
+    current_user: AuthUser = Depends(require_full_account),
+) -> dict[str, Any]:
+    """Send a new email."""
+    try:
+        from lib.gmail_api import send_message
+
+        service = await _require_user_gmail_service(current_user.user_id)
+        sent = await asyncio.to_thread(send_message, service, to=req.to, subject=req.subject, body=req.body)
+        return {"status": "sent", "id": sent.get("id")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mail/reply")
+async def mail_reply(
+    req: MailReplyRequest,
+    current_user: AuthUser = Depends(require_full_account),
+) -> dict[str, Any]:
+    """Reply to an existing email."""
+    try:
+        from lib.gmail_api import reply_to_message
+
+        service = await _require_user_gmail_service(current_user.user_id)
+        sent = await asyncio.to_thread(reply_to_message, service, original_id=req.message_id, body=req.body)
+        return {"status": "sent", "id": sent.get("id")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mail/draft-with-ai")
+async def mail_draft_with_ai(
+    req: MailDraftRequest,
+    current_user: AuthUser = Depends(require_full_account),
+) -> dict[str, Any]:
+    """Generate an AI draft reply for an email. Returns { draft: string }."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY required for AI draft")
+    try:
+        from lib.gmail_api import get_message
+        from google import genai
+
+        service = await _require_user_gmail_service(current_user.user_id)
+        msg = await asyncio.to_thread(get_message, service, req.message_id)
+        from_addr = msg.get("from", "")
+        subject = msg.get("subject", "")
+        body = (msg.get("body") or "")[:8000]
+        prompt = f"""You are helping reply to an email. Write a concise, professional reply.
+
+From: {from_addr}
+Subject: {subject}
+
+Email body:
+---
+{body}
+---
+
+Write only the reply body (plain text, no subject/headers). Keep it brief and actionable. Sign off appropriately if it's to a client or colleague."""
+        client = genai.Client(api_key=api_key)
+        response = await asyncio.to_thread(
+            lambda: client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+        )
+        draft = (getattr(response, "text", None) or "").strip()
+        if not draft and response and getattr(response, "candidates", None):
+            for c in response.candidates or []:
+                if getattr(c, "content", None) and getattr(c.content, "parts", None):
+                    for p in c.content.parts or []:
+                        if getattr(p, "text", None):
+                            draft = (p.text or "").strip()
+                            break
+                    if draft:
+                        break
+        return {"draft": draft}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/admin/logs")
@@ -675,6 +2318,8 @@ async def admin_logs(
 ) -> list[dict[str, Any]]:
     if not _is_admin_user(current_user.user_id):
         raise HTTPException(status_code=403, detail="Admin access required")
+    if LOCAL_RUN_STORE:
+        return []
     return await RUN_STORE.list_logs(limit=max(1, min(limit, 2000)))
 
 
@@ -707,8 +2352,12 @@ async def list_runs(current_user: AuthUser = Depends(get_current_user)) -> list[
         )
 
     persisted: list[dict[str, Any]] = []
-    db_rows = await RUN_STORE.list_runs(current_user.user_id)
-    persisted.extend(_db_row_to_run_list_item(row) for row in db_rows)
+    if LOCAL_RUN_STORE:
+        local_rows = _list_local_run_records(current_user.user_id)
+        persisted.extend(_db_row_to_run_list_item(row) for row in local_rows)
+    else:
+        db_rows = await RUN_STORE.list_runs(current_user.user_id)
+        persisted.extend(_db_row_to_run_list_item(row) for row in db_rows)
 
     by_id: dict[str, dict[str, Any]] = {}
     for item in persisted:
@@ -735,10 +2384,15 @@ async def get_run(run_id: str, current_user: AuthUser = Depends(get_current_user
             detail["activity"] = RUNS[run_id].get("activity", [])[:50]
         return detail
 
-    # DB-backed persisted history.
-    db_row = await RUN_STORE.get_run(run_id, current_user.user_id)
-    if db_row:
-        return _db_row_to_run_detail(db_row)
+    # Persisted history.
+    if LOCAL_RUN_STORE:
+        local_row = _load_local_run_record(run_id)
+        if local_row and local_row.get("owner_user_id") == current_user.user_id:
+            return _db_row_to_run_detail(local_row)
+    else:
+        db_row = await RUN_STORE.get_run(run_id, current_user.user_id)
+        if db_row:
+            return _db_row_to_run_detail(db_row)
 
     raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
 
@@ -778,6 +2432,216 @@ async def submit_clarification(
     pending["response"] = response
     pending["responded_at"] = datetime.utcnow().isoformat()
     return {"status": "accepted", "run_id": run_id, "clarification_id": pending.get("id")}
+
+
+@app.post("/api/runs/{run_id}/formatter-followup")
+async def submit_formatter_followup(
+    run_id: str,
+    request: FormatterFollowupRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    run = RUNS.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not active")
+    if not _run_belongs_to_user(run, current_user.user_id):
+        raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+    snapshot: dict[str, Any] | None = run.get("snapshot") if isinstance(run.get("snapshot"), dict) else None
+    base_query = str(run.get("query") or "")
+
+    if not snapshot:
+        raise HTTPException(status_code=409, detail="Run snapshot unavailable for follow-up")
+
+    prompt = request.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Follow-up prompt cannot be empty")
+
+    parent_formatter = _last_formatter_node(snapshot)
+    if not parent_formatter:
+        raise HTTPException(status_code=409, detail="No formatter output available for follow-up")
+    previous_answer = _extract_best_formatter_text(parent_formatter.get("output"))
+    if not previous_answer:
+        previous_answer = "Previous answer unavailable."
+
+    if run and run.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Run is currently busy. Try again in a moment.")
+
+    followup_query = _build_research_followup_query(
+        base_query=base_query or str(snapshot.get("query") or ""),
+        followup_prompt=prompt,
+        previous_answer=previous_answer,
+    )
+    step_ids = _next_followup_step_ids(snapshot, 6, prefix="FUPR")
+    planner_id, retriever_id, thinker_id, distiller_id, qa_id, formatter_id = step_ids
+
+    nodes = snapshot.setdefault("nodes", [])
+    links = snapshot.setdefault("links", [])
+    globals_schema = snapshot.setdefault("globals_schema", {})
+    if not isinstance(nodes, list) or not isinstance(links, list) or not isinstance(globals_schema, dict):
+        raise HTTPException(status_code=500, detail="Corrupt run snapshot structure")
+
+    read_previous_answer = f"followup_previous_answer_{planner_id}"
+    read_followup_prompt = f"followup_prompt_{planner_id}"
+    write_planner = f"followup_plan_{planner_id}"
+    write_retriever = f"followup_retrieval_{retriever_id}"
+    write_thinker = f"followup_reasoning_{thinker_id}"
+    write_distiller = f"followup_distilled_{distiller_id}"
+    write_qa = f"followup_qa_{qa_id}"
+    write_formatter = f"followup_final_{formatter_id}"
+
+    globals_schema[read_previous_answer] = previous_answer
+    globals_schema[read_followup_prompt] = prompt
+
+    new_nodes = [
+        {
+            "id": planner_id,
+            "agent": "PlannerAgent",
+            "description": "Follow-up planning for deeper research",
+            "agent_prompt": "Plan the deeper follow-up research steps.",
+            "reads": [read_previous_answer, read_followup_prompt],
+            "writes": [write_planner],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+        {
+            "id": retriever_id,
+            "agent": "RetrieverAgent",
+            "description": "Retrieve follow-up evidence",
+            "agent_prompt": "Collect follow-up evidence with sources.",
+            "reads": [read_previous_answer, read_followup_prompt, write_planner],
+            "writes": [write_retriever],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+        {
+            "id": thinker_id,
+            "agent": "ThinkerAgent",
+            "description": "Analyze follow-up evidence",
+            "agent_prompt": "Analyze follow-up evidence and trade-offs.",
+            "reads": [write_planner, write_retriever],
+            "writes": [write_thinker],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+        {
+            "id": distiller_id,
+            "agent": "DistillerAgent",
+            "description": "Distill follow-up findings",
+            "agent_prompt": "Distill follow-up findings into concise insights.",
+            "reads": [write_thinker],
+            "writes": [write_distiller],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+        {
+            "id": qa_id,
+            "agent": "QAAgent",
+            "description": "Validate follow-up quality",
+            "agent_prompt": "Validate follow-up quality and identify issues.",
+            "reads": [write_distiller, write_retriever],
+            "writes": [write_qa],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+        {
+            "id": formatter_id,
+            "agent": "FormatterAgent",
+            "description": "Format final follow-up answer",
+            "agent_prompt": "Generate final follow-up answer for the user.",
+            "reads": [write_planner, write_retriever, write_thinker, write_distiller, write_qa],
+            "writes": [write_formatter],
+            "status": "pending",
+            "output": None,
+            "error": None,
+            "cost": 0.0,
+            "start_time": None,
+            "end_time": None,
+            "execution_time": 0.0,
+        },
+    ]
+    nodes.extend(new_nodes)
+    links.extend(
+        [
+            {"source": str(parent_formatter.get("id")), "target": planner_id},
+            {"source": planner_id, "target": retriever_id},
+            {"source": retriever_id, "target": thinker_id},
+            {"source": thinker_id, "target": distiller_id},
+            {"source": distiller_id, "target": qa_id},
+            {"source": qa_id, "target": formatter_id},
+        ]
+    )
+
+    if run:
+        run["status"] = "running"
+        run["error"] = None
+        snapshot["status"] = "running"
+        _publish_event(run_id, {"snapshot": snapshot}, event="run_update")
+        run_record = _build_run_record(run_id)
+        if run_record and _cloud_persist_runs(current_user.user_id):
+            await RUN_STORE.upsert_run(run_record)
+
+    if _cloud_persist_runs(current_user.user_id):
+        await RUN_STORE.insert_log(
+            level="INFO",
+            event_type="run_followup_created",
+            message="In-run research follow-up graph created",
+            owner_user_id=current_user.user_id,
+            run_id=run_id,
+            payload={"followup_prompt": prompt, "node_ids": step_ids},
+        )
+
+    asyncio.create_task(
+        _run_research_followup_in_run(
+            run_id=run_id,
+            node_ids={
+                "planner": planner_id,
+                "retriever": retriever_id,
+                "thinker": thinker_id,
+                "distiller": distiller_id,
+                "qa": qa_id,
+                "formatter": formatter_id,
+            },
+            read_keys={
+                "previous_answer": read_previous_answer,
+                "followup_prompt": read_followup_prompt,
+            },
+            write_keys={
+                "planner": write_planner,
+                "retriever": write_retriever,
+                "thinker": write_thinker,
+                "distiller": write_distiller,
+                "qa": write_qa,
+                "formatter": write_formatter,
+            },
+            followup_query=followup_query,
+            owner_user_id=current_user.user_id,
+        )
+    )
+    return {"status": "accepted", "run_id": run_id, "mode": "research_in_run", "added_nodes": step_ids}
 
 
 @app.get("/api/runs/{run_id}/events")
@@ -836,6 +2700,23 @@ async def create_run(
     request: RunCreateRequest,
     current_user: AuthUser = Depends(get_current_user),
 ) -> RunCreateResponse:
+    if current_user.is_guest:
+        gsk = guest_session_key(current_user.user_id)
+        if not gsk:
+            raise HTTPException(status_code=401, detail="Invalid guest session")
+        try:
+            await guest_try_consume_run(gsk, guest_run_limit())
+        except ValueError:
+            lim = guest_run_limit()
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "GUEST_RUN_LIMIT",
+                    "message": f"You have used all {lim} free guest runs. Sign in with Google to continue.",
+                    "runs_limit": lim,
+                },
+            ) from None
+
     run_id = f"run_{uuid4().hex[:10]}"
     RUNS[run_id] = {
         "query": request.query,
@@ -867,18 +2748,21 @@ async def create_run(
         "activity": [],
         "pending_clarification": None,
     }
-    await RUN_STORE.upsert_user(current_user.user_id, current_user.email)
+    _save_local_run_record(run_id)
+    if _cloud_persist_runs(current_user.user_id):
+        await RUN_STORE.upsert_user(current_user.user_id, current_user.email)
     run_record = _build_run_record(run_id)
-    if run_record:
+    if run_record and _cloud_persist_runs(current_user.user_id):
         await RUN_STORE.upsert_run(run_record)
-    await RUN_STORE.insert_log(
-        level="INFO",
-        event_type="run_created",
-        message="Run created",
-        owner_user_id=current_user.user_id,
-        run_id=run_id,
-        payload={"query": request.query},
-    )
+    if _cloud_persist_runs(current_user.user_id):
+        await RUN_STORE.insert_log(
+            level="INFO",
+            event_type="run_created",
+            message="Run created",
+            owner_user_id=current_user.user_id,
+            run_id=run_id,
+            payload={"query": request.query},
+        )
     asyncio.create_task(_execute_run(run_id, request.query, current_user.user_id, current_user.email))
     return RunCreateResponse(run_id=run_id, status="running", summary={})
 
