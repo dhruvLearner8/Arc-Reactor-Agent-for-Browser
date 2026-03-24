@@ -4,6 +4,8 @@
 
 **Companion doc:** The human-facing product README is [`README.md`](./README.md) (demos, Render/Supabase, full API list). **This file is the “navigation map” for code changes.**
 
+**Filename:** This doc is **`AGENT_README.md`** (Markdown). There is no `AGENT_README.py` — hand this `.md` file to another agent as context.
+
 ---
 
 ## 1. Mental model (30 seconds)
@@ -24,11 +26,12 @@
 
 | Order | File | Why |
 |------:|------|-----|
-| 1 | `api_server.py` | All HTTP routes, `RUNS` state, SSE, clarification & formatter follow-up, persistence |
+| 1 | `api_server.py` | All HTTP routes, `RUNS` state, SSE, clarification & formatter follow-up, **scheduled jobs**, persistence |
 | 2 | `core/loop.py` | `AgentLoop4`, DAG scheduling, per-step execution, progress hooks |
 | 3 | `memory/context.py` | Graph lifecycle, `get_ready_steps`, `mark_done`, extraction into `globals_schema` |
 | 4 | `agents/base_agent.py` | `AgentRunner`: builds prompts, calls model, parses JSON, dispatches MCP tools |
-| 5 | `frontend/src/App.jsx` | Run list, graph (ReactFlow), inspector, SSE + clarification / follow-up UI |
+| 5 | `frontend/src/App.jsx` | Run list, graph (ReactFlow), inspector (**Preview / Rendered / JSON / Web URLs**), **Scheduler** UI, Mail, Notepad, SSE + clarification / follow-up |
+| — | `scheduler_service.py` | `build_query(subject, params)` → natural-language query for jobs / weather / stocks / news / custom |
 
 Then drill into **`prompts/*.md`** and **`mcp_servers/multi_mcp.py`** when changing behavior vs. infrastructure.
 
@@ -61,6 +64,17 @@ GET  /api/runs/{id}/events?ticket=...  →  SSE stream (immediate snapshot, then
 - `POST /api/runs/{id}/clarification` — user answers a pending clarification (see §6).
 - `POST /api/runs/{id}/formatter-followup` — appends a **new subgraph** after the last formatter and resumes execution in-process (see §7).
 
+**Scheduled jobs (Scheduler):**
+
+- `GET /api/scheduled-jobs` — list current user’s jobs (each item includes computed **`built_query`**).
+- `POST /api/scheduled-jobs` — create job (`name`, `subject`, `params`, `schedule_type`, `cron_expr` or `interval_minutes`).
+- `GET /api/scheduled-jobs/{job_id}` — get one job.
+- `PATCH /api/scheduled-jobs/{job_id}` — update fields / `enabled`.
+- `DELETE /api/scheduled-jobs/{job_id}` — delete (local file + Supabase when enabled).
+- `POST /api/scheduled-jobs/{job_id}/run-now` — start **`_execute_run`** immediately with that job’s built query; returns `{ run_id, query, job }`.
+
+See **§14** for persistence, APScheduler, and UI behavior.
+
 ---
 
 ## 5. In-memory run state (`RUNS`)
@@ -72,6 +86,7 @@ GET  /api/runs/{id}/events?ticket=...  →  SSE stream (immediate snapshot, then
 - **`subscribers`** — `asyncio.Queue` set for SSE fan-out
 - **`pending_clarification`** — when set, orchestration waits for user input (see §6)
 - **`activity`** — short human-readable log lines for the inspector
+- **`scheduled_job_id`** (optional) — set when the run was started by a scheduled job or **run-now** from the Scheduler.
 
 Persistence: **local JSON** under `memory/local_runs/` when `LOCAL_RUN_STORE=1`, else **Supabase** when configured. Session graph files under `memory/session_summaries_index/` when `SAVE_LOCAL_SESSIONS` is on (see env table).
 
@@ -112,6 +127,8 @@ When the DAG needs user input, the backend sets **`pending_clarification`** on t
 
 Progress and snapshots are pushed back to `api_server` via callbacks/hooks (search `_emit_progress`, snapshot builders in `api_server.py`).
 
+**Concurrency (multiple runs):** Each `POST /api/runs` (and each scheduler **run-now** / cron fire) uses **`asyncio.create_task(_execute_run(...))`**. Separate runs execute **concurrently** on the same event loop (not serialized). Inside **one** run, steps with satisfied dependencies are executed in parallel via **`asyncio.gather`** in `_execute_dag` (`core/loop.py`).
+
 ---
 
 ## 9. Context graph (`memory/context.py`)
@@ -146,10 +163,14 @@ When tools return odd shapes, **`multi_mcp`** may coerce types so **`AgentRunner
 
 ## 12. Frontend (`frontend/`)
 
-- **Vite + React;** main surface: `src/App.jsx` (large file — search by feature: `EventSource`, `stream-ticket`, `clarification`, `formatter`).
+- **Vite + React;** main surface: `src/App.jsx` (large file — search by feature: `EventSource`, `stream-ticket`, `clarification`, `formatter`, `scheduled-jobs`, `extractUrlsFromRun`, `formatterMarkdownFromRunData`).
 - **Auth:** Supabase client + `LoginPage.jsx` / `HomePage.jsx`.
 - **Graph:** ReactFlow for nodes/edges from `snapshot`.
-- **Inspector:** node output JSON vs markdown rendering (formatter outputs may mix metadata + content — prefer content keys for display).
+- **Left rail:** **Agent Run** (default), **Notepad**, **Mail** (Gmail), **Scheduler** (clock icon).
+- **Inspector (Agent Run):** tabs **Preview** / **Rendered** / **JSON** / **Web URLs**. Output markdown uses `renderNodeOutput(selectedNode)` + `ReactMarkdown` + `remarkGfm`.
+- **Web URLs tab:** `extractUrlsFromRun(runDetail)` walks **`nodes[].output`** and **`globals_schema`** for strings matching `http(s)://…`, deduped and sorted; shown as external links.
+- **Scheduler panel:** card grid; each card shows **`built_query`**, **Run now** (`POST …/run-now` + poll `GET /api/runs/{id}`), **Load last run** (uses `last_run_id`). Results markdown uses **`formatterMarkdownFromRunData`**, which calls **`renderNodeOutput`** on the Formatter node — same pipeline as Inspector Preview (HTML→Markdown via Turndown, table normalization, `objectToMarkdown` fallback).
+- **`VITE_API_BASE_URL`:** point the browser at the API host (e.g. `http://127.0.0.1:8000`); if unset, relative `/api/…` hits the Vite dev server and breaks.
 
 ---
 
@@ -162,19 +183,32 @@ When tools return odd shapes, **`multi_mcp`** may coerce types so **`AgentRunner
 | `DAG_MAX_ITERATIONS` | Cap for DAG scheduler loop in `core/loop.py` (default 500) |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Cloud persistence + auth alignment |
 | `CORS_ORIGINS` | Comma-separated allowed origins (defaults include Vite `5173`) |
+| `SCHEDULER_TIMEZONE` | IANA tz for APScheduler cron (default **`America/Regina`**) |
+| `apscheduler` | Declared in `pyproject.toml`; scheduler starts in FastAPI **lifespan** in `api_server.py` |
 
 See also `README.md` and `docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md` for deployment.
 
 ---
 
-## 14. Tests and benchmarks
+## 14. Scheduled jobs — backend detail (`api_server.py` + `scheduler_service.py`)
+
+- **Query text:** `scheduler_service.build_query(subject, params)` builds the string passed to **`AgentLoop4`** (subjects: `jobs`, `weather`, `stocks`, `news`, `custom`).
+- **Persistence (dual):** Every create/update/delete touches **`memory/scheduled_jobs/jobs.json`** via **`_upsert_job_in_local_store`** / **`_remove_job_from_local_store`**. If **`_use_supabase_store()`** is true, Supabase table **`scheduled_jobs`** is also updated (see migrations).
+- **List / APScheduler reload:** **`_list_scheduled_jobs_merged`** and **`_all_enabled_scheduled_jobs_merged`** merge **cloud + local** by job `id` (local wins on conflict). This avoids “empty list” when Supabase upsert fails but the job exists locally.
+- **Owner matching:** **`_owner_ids_match`** normalizes UUID strings (case/spacing) for list/delete.
+- **APScheduler:** **`AsyncIOScheduler`** in app **lifespan**; **`_reload_scheduled_jobs`** registers cron or interval jobs; firing calls **`_on_scheduled_job_fire`** → **`_start_agent_run_for_scheduled_job`** + **`_after_scheduled_run_started`** (persist **`last_run_id`** locally always; cloud when configured).
+- **Supabase migrations:** `db/migrations/003_scheduled_jobs.sql` (table), `004_scheduled_jobs_last_run.sql` (`last_run_id`, `last_run_at`). Not required for pure local file mode if `LOCAL_RUN_STORE=1` disables cloud store (see `_use_supabase_store()`).
+
+---
+
+## 15. Tests and benchmarks
 
 - **`test_*.py`** at repo root — agent isolation, planner acid, flow tests; run with your usual `pytest` / `uv run` workflow.
 - **`benchmarks/research_smoke/`** — smoke runner for retrieval-style scenarios.
 
 ---
 
-## 15. Safe extension points (summary)
+## 16. Safe extension points (summary)
 
 | Goal | Likely touch points |
 |------|---------------------|
@@ -183,10 +217,12 @@ See also `README.md` and `docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md` for depl
 | Change DAG rules / retries | `core/loop.py`, `memory/context.py` |
 | New API or event | `api_server.py`, then `App.jsx` if UI-facing |
 | Stricter output parsing | `agents/base_agent.py`, `core/json_parser.py` |
+| New scheduled subject / query template | `scheduler_service.py` + Scheduler form in `App.jsx` |
+| Inspector output tabs | `App.jsx` (`viewMode`), `styles.css` |
 
 ---
 
-## 16. Glossary
+## 17. Glossary
 
 | Term | Meaning |
 |------|---------|
@@ -195,7 +231,9 @@ See also `README.md` and `docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md` for depl
 | **Snapshot** | JSON-serializable graph + schema the UI and persistence use |
 | **SSE** | Server-Sent Events for streaming run updates |
 | **MCP** | Model Context Protocol tool servers |
+| **built_query** | Server-computed agent prompt for a scheduled job (returned on list/create/get) |
+| **run-now** | Immediate `POST /api/scheduled-jobs/{id}/run-now` without waiting for cron |
 
 ---
 
-*Last aligned with repo layout: S8 Share. If something disagrees with code, trust the code and update this file.*
+*Last aligned with repo layout: S8 Share (Scheduler, Web URLs tab, dual scheduled-job persistence). If something disagrees with code, trust the code and update this file.*

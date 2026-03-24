@@ -2,12 +2,15 @@ import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -19,10 +22,13 @@ from agents.base_agent import AgentRunner
 from core.loop import AgentLoop4
 from mcp_servers.multi_mcp import MultiMCP
 
+from scheduler_service import build_query
+
 
 BASE_DIR = Path(__file__).parent
 SESSIONS_DIR = BASE_DIR / "memory" / "session_summaries_index"
 LOCAL_RUNS_DIR = BASE_DIR / "memory" / "local_runs"
+LOCAL_SCHEDULED_JOBS_DIR = BASE_DIR / "memory" / "scheduled_jobs"
 load_dotenv(BASE_DIR / ".env")
 LOCAL_RUN_STORE = (os.getenv("LOCAL_RUN_STORE") or "0").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -75,7 +81,49 @@ class MailDraftRequest(BaseModel):
     message_id: str = Field(min_length=1)
 
 
-app = FastAPI(title="S15 NewArch API", version="0.1.0")
+class ScheduledJobCreateRequest(BaseModel):
+    name: str = Field(default="Scheduled Job", min_length=1, max_length=200)
+    subject: str = Field(..., description="jobs | weather | stocks | news | custom")
+    params: dict[str, Any] = Field(default_factory=dict)
+    schedule_type: str = Field(..., description="cron | interval")
+    cron_expr: str | None = Field(default=None, description='e.g. "0 7 * * *" for 7am daily')
+    interval_minutes: int | None = Field(default=None, ge=1, le=10080)  # max 1 week
+
+
+class ScheduledJobUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    subject: str | None = None
+    params: dict[str, Any] | None = None
+    schedule_type: str | None = None
+    cron_expr: str | None = None
+    interval_minutes: int | None = Field(default=None, ge=1, le=10080)
+    enabled: bool | None = None
+
+
+JOB_SCHEDULER: AsyncIOScheduler | None = None
+
+
+def _scheduler_timezone() -> ZoneInfo:
+    tz_name = (os.getenv("SCHEDULER_TIMEZONE") or "America/Regina").strip()
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("America/Regina")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global JOB_SCHEDULER
+    JOB_SCHEDULER = AsyncIOScheduler(timezone=_scheduler_timezone())
+    JOB_SCHEDULER.start()
+    await _reload_scheduled_jobs()
+    yield
+    if JOB_SCHEDULER:
+        JOB_SCHEDULER.shutdown(wait=False)
+        JOB_SCHEDULER = None
+
+
+app = FastAPI(title="S15 NewArch API", version="0.1.0", lifespan=lifespan)
 
 cors_origins_env = os.getenv("CORS_ORIGINS", "")
 cors_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
@@ -237,6 +285,113 @@ class SupabaseRunStore:
             prefer="return=minimal",
         )
 
+    async def list_scheduled_jobs(self, user_id: str) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/scheduled_jobs",
+                params={
+                    "select": "id,owner_user_id,owner_email,name,subject,params,schedule_type,cron_expr,interval_minutes,enabled,created_at,updated_at,last_run_id,last_run_at",
+                    "owner_user_id": f"eq.{user_id}",
+                    "order": "created_at.desc",
+                },
+            )
+            return rows if isinstance(rows, list) else []
+        except Exception:
+            return []
+
+    async def get_scheduled_job(self, job_id: str, user_id: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/scheduled_jobs",
+                params={
+                    "select": "*",
+                    "id": f"eq.{job_id}",
+                    "owner_user_id": f"eq.{user_id}",
+                    "limit": "1",
+                },
+            )
+            return rows[0] if isinstance(rows, list) and rows else None
+        except Exception:
+            return None
+
+    async def upsert_scheduled_job(self, job: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        row: dict[str, Any] = {
+            "id": job["id"],
+            "owner_user_id": job["owner_user_id"],
+            "owner_email": job.get("owner_email"),
+            "name": job.get("name", "Scheduled Job"),
+            "subject": job.get("subject", "custom"),
+            "params": job.get("params", {}),
+            "schedule_type": job.get("schedule_type", "cron"),
+            "cron_expr": job.get("cron_expr"),
+            "interval_minutes": job.get("interval_minutes"),
+            "enabled": job.get("enabled", True),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        if job.get("last_run_id") is not None:
+            row["last_run_id"] = job.get("last_run_id")
+        if job.get("last_run_at") is not None:
+            row["last_run_at"] = job.get("last_run_at")
+        payload = [row]
+        try:
+            await self._request(
+                "POST",
+                "/rest/v1/scheduled_jobs",
+                params={"on_conflict": "id"},
+                payload=payload,
+                prefer="resolution=merge-duplicates,return=minimal",
+            )
+        except Exception as exc:
+            print(f"[scheduled_jobs] Supabase upsert failed: {exc}")
+
+    async def delete_scheduled_job(self, job_id: str, user_id: str) -> bool:
+        """Returns True only if Supabase reports at least one deleted row."""
+        if not self.enabled:
+            return False
+        try:
+            headers = dict(self._headers)
+            headers["Prefer"] = "return=representation"
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.delete(
+                    f"{self.url}/rest/v1/scheduled_jobs",
+                    params={"id": f"eq.{job_id}", "owner_user_id": f"eq.{user_id}"},
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                if not resp.content:
+                    return False
+                data = resp.json()
+                return isinstance(data, list) and len(data) > 0
+        except Exception as exc:
+            print(f"[scheduled_jobs] Supabase delete: {exc}")
+            return False
+
+    async def list_all_enabled_scheduled_jobs(self) -> list[dict[str, Any]]:
+        """All enabled jobs across users, for scheduler reload."""
+        if not self.enabled:
+            return []
+        try:
+            rows = await self._request(
+                "GET",
+                "/rest/v1/scheduled_jobs",
+                params={
+                    "select": "id,owner_user_id,owner_email,name,subject,params,schedule_type,cron_expr,interval_minutes,enabled",
+                    "enabled": "eq.true",
+                    "order": "created_at.desc",
+                },
+            )
+            return rows if isinstance(rows, list) else []
+        except Exception:
+            return []
+
     async def list_logs(self, limit: int = 500) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
@@ -328,6 +483,115 @@ def _load_local_run_record(run_id: str) -> dict[str, Any] | None:
         return payload if isinstance(payload, dict) else None
     except Exception:
         return None
+
+
+def _local_scheduled_jobs_path() -> Path:
+    LOCAL_SCHEDULED_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    return LOCAL_SCHEDULED_JOBS_DIR / "jobs.json"
+
+
+def _load_all_local_scheduled_jobs() -> list[dict[str, Any]]:
+    return [j for j in _load_local_scheduled_jobs_raw() if j.get("enabled", True)]
+
+
+def _save_local_scheduled_jobs(jobs: list[dict[str, Any]]) -> None:
+    path = _local_scheduled_jobs_path()
+    with path.open("w", encoding="utf-8") as f:
+        json.dump({"jobs": jobs}, f, ensure_ascii=False, indent=2)
+
+
+def _load_local_scheduled_jobs_raw() -> list[dict[str, Any]]:
+    """All jobs from local file (including disabled)."""
+    path = _local_scheduled_jobs_path()
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        jobs = data.get("jobs", data) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        return [j for j in jobs if isinstance(j, dict)]
+    except Exception:
+        return []
+
+
+def _upsert_job_in_local_store(job: dict[str, Any]) -> None:
+    """Always persist one job to memory/scheduled_jobs/jobs.json (survives missing Supabase table)."""
+    jobs = _load_local_scheduled_jobs_raw()
+    jid = job.get("id")
+    if not jid:
+        return
+    idx = next((i for i, j in enumerate(jobs) if j.get("id") == jid), None)
+    if idx is not None:
+        jobs[idx] = dict(job)
+    else:
+        jobs.insert(0, dict(job))
+    _save_local_scheduled_jobs(jobs)
+
+
+def _owner_ids_match(stored: Any, current: str) -> bool:
+    """JWT sub and JSON may differ only by case/spacing for UUIDs."""
+    a = str(stored or "").strip().lower()
+    b = str(current or "").strip().lower()
+    return bool(a) and a == b
+
+
+def _remove_job_from_local_store(job_id: str, owner_user_id: str) -> bool:
+    jobs = _load_local_scheduled_jobs_raw()
+    if not jobs:
+        return False
+    uid = str(owner_user_id)
+    # Match job_id as string (path params are always str)
+    new_jobs = [
+        j
+        for j in jobs
+        if not (str(j.get("id")) == str(job_id) and _owner_ids_match(j.get("owner_user_id"), uid))
+    ]
+    if len(new_jobs) == len(jobs):
+        return False
+    _save_local_scheduled_jobs(new_jobs)
+    return True
+
+
+async def _list_scheduled_jobs_merged(user_id: str) -> list[dict[str, Any]]:
+    """Supabase rows + local file, keyed by job id (local wins on conflict)."""
+    uid = str(user_id)
+    by_id: dict[str, dict[str, Any]] = {}
+    if _use_supabase_store():
+        try:
+            for j in await RUN_STORE.list_scheduled_jobs(user_id):
+                if isinstance(j, dict) and j.get("id"):
+                    by_id[str(j["id"])] = dict(j)
+        except Exception as exc:
+            print(f"[scheduled_jobs] Supabase list failed, using local only: {exc}")
+    for j in _load_local_scheduled_jobs_raw():
+        if not _owner_ids_match(j.get("owner_user_id"), uid):
+            continue
+        if j.get("id"):
+            by_id[str(j["id"])] = dict(j)
+    return list(by_id.values())
+
+
+async def _all_enabled_scheduled_jobs_merged() -> list[dict[str, Any]]:
+    """For APScheduler: every enabled job from cloud + local (local wins on id clash)."""
+    by_id: dict[str, dict[str, Any]] = {}
+    if _use_supabase_store():
+        try:
+            for j in await RUN_STORE.list_all_enabled_scheduled_jobs():
+                if isinstance(j, dict) and j.get("id"):
+                    by_id[str(j["id"])] = dict(j)
+        except Exception as exc:
+            print(f"[scheduled_jobs] list_all_enabled failed: {exc}")
+    for j in _load_all_local_scheduled_jobs():
+        if j.get("id"):
+            by_id[str(j["id"])] = dict(j)
+    return list(by_id.values())
+
+
+def _get_scheduled_job_from_local(job_id: str, owner_user_id: str) -> dict[str, Any] | None:
+    for j in _load_local_scheduled_jobs_raw():
+        if str(j.get("id")) == str(job_id) and _owner_ids_match(j.get("owner_user_id"), str(owner_user_id)):
+            return dict(j)
+    return None
 
 
 def _list_local_run_records(user_id: str, limit: int = 200) -> list[dict[str, Any]]:
@@ -817,6 +1081,185 @@ async def _watch_session_file(run_id: str, stop_event: asyncio.Event) -> None:
         await asyncio.sleep(0.6)
 
 
+def _enrich_scheduled_job(job: dict[str, Any]) -> dict[str, Any]:
+    out = dict(job)
+    out["built_query"] = build_query(job.get("subject", "custom"), job.get("params") or {})
+    return out
+
+
+async def _persist_scheduled_job_last_run(job_id: str, owner_user_id: str, run_id: str) -> None:
+    now_iso = datetime.utcnow().isoformat()
+    uid = str(owner_user_id)
+    jobs = _load_local_scheduled_jobs_raw()
+    for i, j in enumerate(jobs):
+        if j.get("id") == job_id and str(j.get("owner_user_id")) == uid:
+            jobs[i] = {**j, "last_run_id": run_id, "last_run_at": now_iso}
+            _save_local_scheduled_jobs(jobs)
+            break
+    if _use_supabase_store():
+        job = await RUN_STORE.get_scheduled_job(job_id, owner_user_id)
+        if job:
+            job = dict(job)
+            job["last_run_id"] = run_id
+            job["last_run_at"] = now_iso
+            try:
+                await RUN_STORE.upsert_scheduled_job(job)
+            except Exception as exc:
+                print(f"[scheduled_jobs] persist last_run cloud failed: {exc}")
+
+
+def _start_agent_run_for_scheduled_job(job: dict[str, Any]) -> tuple[str, str]:
+    """Create RUNS entry and spawn _execute_run. Returns (run_id, query)."""
+    job_id = job.get("id") or ""
+    owner_user_id = job.get("owner_user_id") or ""
+    owner_email = job.get("owner_email") or ""
+    query = build_query(job.get("subject", "custom"), job.get("params") or {})
+    if not query.strip():
+        raise ValueError("empty query for scheduled job")
+    run_id = f"run_{uuid4().hex[:10]}"
+    RUNS[run_id] = {
+        "query": query,
+        "created_at": datetime.utcnow().isoformat(),
+        "status": "queued",
+        "summary": {},
+        "snapshot": {
+            "run_id": run_id,
+            "query": query,
+            "status": "queued",
+            "nodes": [
+                {
+                    "id": "BOOTSTRAP_PLANNING",
+                    "agent": "PlannerAgent",
+                    "description": f"Scheduled: {job.get('name', job_id)}",
+                    "status": "running",
+                    "reads": [],
+                    "writes": [],
+                }
+            ],
+            "links": [],
+            "globals_schema": {},
+            "activity": [],
+        },
+        "subscribers": set(),
+        "session_id": None,
+        "owner_user_id": owner_user_id,
+        "owner_email": owner_email,
+        "activity": [],
+        "pending_clarification": None,
+        "scheduled_job_id": job_id,
+    }
+    _save_local_run_record(run_id)
+    asyncio.create_task(_execute_run(run_id, query, owner_user_id, owner_email))
+    return run_id, query
+
+
+async def _after_scheduled_run_started(
+    job: dict[str, Any],
+    run_id: str,
+    query: str,
+    *,
+    event_type: str = "scheduled_job_fired",
+    log_message: str = "Scheduled job executed",
+) -> None:
+    job_id = job.get("id") or ""
+    owner_user_id = job.get("owner_user_id") or ""
+    owner_email = job.get("owner_email") or ""
+    if _use_supabase_store():
+        await RUN_STORE.upsert_user(owner_user_id, owner_email)
+    run_record = _build_run_record(run_id)
+    if run_record and _use_supabase_store():
+        await RUN_STORE.upsert_run(run_record)
+    if _use_supabase_store():
+        await RUN_STORE.insert_log(
+            level="INFO",
+            event_type=event_type,
+            message=log_message,
+            owner_user_id=owner_user_id,
+            run_id=run_id,
+            payload={"query": query, "scheduled_job_id": job_id},
+        )
+    await _persist_scheduled_job_last_run(job_id, owner_user_id, run_id)
+
+
+async def _on_scheduled_job_fire(job_id: str) -> None:
+    """Called by APScheduler when a scheduled job fires."""
+    jobs = await _all_enabled_scheduled_jobs_merged()
+    job = next((j for j in jobs if str(j.get("id")) == str(job_id)), None)
+    if not job:
+        print(f"[scheduler] job {job_id} not found, skipping")
+        return
+    try:
+        run_id, query = _start_agent_run_for_scheduled_job(job)
+    except ValueError as e:
+        print(f"[scheduler] job {job_id}: {e}")
+        return
+    await _after_scheduled_run_started(job, run_id, query)
+    print(f"[scheduler] job {job_id} started run {run_id}")
+
+
+async def _reload_scheduled_jobs() -> None:
+    """Load all enabled jobs and register with APScheduler."""
+    if not JOB_SCHEDULER:
+        return
+    for j in JOB_SCHEDULER.get_jobs():
+        try:
+            j.remove()
+        except Exception:
+            pass
+    jobs = await _all_enabled_scheduled_jobs_merged()
+    for job in jobs:
+        job_id = job.get("id")
+        if not job_id:
+            continue
+        schedule_type = (job.get("schedule_type") or "cron").lower()
+        try:
+            if schedule_type == "interval":
+                mins = job.get("interval_minutes") or 60
+                JOB_SCHEDULER.add_job(
+                    _on_scheduled_job_fire,
+                    "interval",
+                    minutes=mins,
+                    id=job_id,
+                    args=[job_id],
+                    replace_existing=True,
+                )
+            else:
+                cron = job.get("cron_expr") or "0 7 * * *"  # default 7am daily
+                JOB_SCHEDULER.add_job(
+                    _on_scheduled_job_fire,
+                    "cron",
+                    **{k: v for k, v in _cron_to_kwargs(cron).items() if v is not None},
+                    id=job_id,
+                    args=[job_id],
+                    replace_existing=True,
+                )
+        except Exception as e:
+            print(f"[scheduler] failed to add job {job_id}: {e}")
+
+
+def _cron_to_kwargs(cron_expr: str) -> dict[str, Any]:
+    """Convert cron 'min hour day month dow' to APScheduler cron trigger kwargs."""
+    parts = (cron_expr or "0 7 * * *").strip().split()
+    kwargs = {}
+    if len(parts) > 0:
+        kwargs["minute"] = int(parts[0]) if parts[0] != "*" else 0
+    if len(parts) > 1 and parts[1] != "*":
+        kwargs["hour"] = int(parts[1])
+    if len(parts) > 2 and parts[2] != "*":
+        try:
+            kwargs["day"] = int(parts[2])
+        except ValueError:
+            kwargs["day"] = parts[2]
+    if len(parts) > 3 and parts[3] != "*":
+        try:
+            kwargs["month"] = int(parts[3])
+        except ValueError:
+            kwargs["month"] = parts[3]
+    if len(parts) > 4 and parts[4] != "*":
+        kwargs["day_of_week"] = parts[4]
+    return kwargs
+
+
 async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email: str | None) -> None:
     multi_mcp = MultiMCP()
     stop_event = asyncio.Event()
@@ -1177,6 +1620,153 @@ async def delete_note(note_id: str, current_user: AuthUser = Depends(get_current
     filtered = [n for n in notes if n.get("id") not in to_delete]
     _save_notes(current_user.user_id, filtered)
     return {"status": "deleted", "id": note_id, "deleted_count": len(to_delete)}
+
+
+# ----- Scheduled Jobs API -----
+@app.get("/api/scheduled-jobs")
+async def list_scheduled_jobs(current_user: AuthUser = Depends(get_current_user)) -> list[dict[str, Any]]:
+    jobs = await _list_scheduled_jobs_merged(current_user.user_id)
+    jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+    return [_enrich_scheduled_job(j) for j in jobs]
+
+
+@app.post("/api/scheduled-jobs")
+async def create_scheduled_job(
+    request: ScheduledJobCreateRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    if (request.schedule_type or "").lower() == "cron" and not (request.cron_expr or "").strip():
+        raise HTTPException(status_code=400, detail="cron_expr required for cron schedule")
+    if (request.schedule_type or "").lower() == "interval" and not request.interval_minutes:
+        raise HTTPException(status_code=400, detail="interval_minutes required for interval schedule")
+    job_id = f"job_{uuid4().hex[:10]}"
+    job = {
+        "id": job_id,
+        "owner_user_id": current_user.user_id,
+        "owner_email": current_user.email,
+        "name": (request.name or "Scheduled Job").strip(),
+        "subject": (request.subject or "custom").strip().lower(),
+        "params": request.params or {},
+        "schedule_type": (request.schedule_type or "cron").strip().lower(),
+        "cron_expr": (request.cron_expr or "").strip() or None,
+        "interval_minutes": request.interval_minutes,
+        "enabled": True,
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    if _use_supabase_store():
+        try:
+            await RUN_STORE.upsert_scheduled_job(job)
+        except Exception as exc:
+            print(f"[scheduled_jobs] create cloud save failed (local still saved): {exc}")
+    _upsert_job_in_local_store(job)
+    await _reload_scheduled_jobs()
+    return _enrich_scheduled_job(job)
+
+
+@app.post("/api/scheduled-jobs/{job_id}/run-now")
+async def run_scheduled_job_now(
+    job_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Start the agent run for this job immediately (same query as scheduled / built_query)."""
+    job = None
+    if _use_supabase_store():
+        job = await RUN_STORE.get_scheduled_job(job_id, current_user.user_id)
+    if not job:
+        job = _get_scheduled_job_from_local(job_id, current_user.user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+    try:
+        run_id, query = _start_agent_run_for_scheduled_job(job)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    await _after_scheduled_run_started(
+        job,
+        run_id,
+        query,
+        event_type="scheduled_job_run_now",
+        log_message="Scheduled job run-now started",
+    )
+    job = dict(job)
+    job["last_run_id"] = run_id
+    job["last_run_at"] = datetime.utcnow().isoformat()
+    return {"run_id": run_id, "query": query, "job": _enrich_scheduled_job(job)}
+
+
+@app.get("/api/scheduled-jobs/{job_id}")
+async def get_scheduled_job(
+    job_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    job = None
+    if _use_supabase_store():
+        job = await RUN_STORE.get_scheduled_job(job_id, current_user.user_id)
+    if not job:
+        job = _get_scheduled_job_from_local(job_id, current_user.user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+    return _enrich_scheduled_job(job)
+
+
+@app.patch("/api/scheduled-jobs/{job_id}")
+async def update_scheduled_job(
+    job_id: str,
+    request: ScheduledJobUpdateRequest,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    job = None
+    if _use_supabase_store():
+        job = await RUN_STORE.get_scheduled_job(job_id, current_user.user_id)
+    if not job:
+        job = _get_scheduled_job_from_local(job_id, current_user.user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Scheduled job not found")
+    if request.name is not None:
+        job["name"] = request.name.strip()
+    if request.subject is not None:
+        job["subject"] = request.subject.strip().lower()
+    if request.params is not None:
+        job["params"] = request.params
+    if request.schedule_type is not None:
+        job["schedule_type"] = request.schedule_type.strip().lower()
+    if request.cron_expr is not None:
+        job["cron_expr"] = request.cron_expr.strip() or None
+    if request.interval_minutes is not None:
+        job["interval_minutes"] = request.interval_minutes
+    if request.enabled is not None:
+        job["enabled"] = request.enabled
+    job["updated_at"] = datetime.utcnow().isoformat()
+    if _use_supabase_store():
+        try:
+            await RUN_STORE.upsert_scheduled_job(job)
+        except Exception as exc:
+            print(f"[scheduled_jobs] patch cloud save failed (local still saved): {exc}")
+    _upsert_job_in_local_store(job)
+    await _reload_scheduled_jobs()
+    return _enrich_scheduled_job(job)
+
+
+@app.delete("/api/scheduled-jobs/{job_id}")
+async def delete_scheduled_job(
+    job_id: str,
+    current_user: AuthUser = Depends(get_current_user),
+) -> dict[str, Any]:
+    # Local file is source of truth for merged UI; remove first so OneDrive/local always updates.
+    ok_local = _remove_job_from_local_store(job_id, current_user.user_id)
+    if _use_supabase_store():
+        try:
+            await RUN_STORE.delete_scheduled_job(job_id, current_user.user_id)
+        except Exception as exc:
+            print(f"[scheduled_jobs] Supabase delete failed: {exc}")
+    if not ok_local:
+        merged = await _list_scheduled_jobs_merged(current_user.user_id)
+        if not any(str(j.get("id")) == str(job_id) for j in merged):
+            await _reload_scheduled_jobs()
+            return {"status": "deleted", "id": job_id}
+        raise HTTPException(status_code=404, detail="Scheduled job not found or access denied")
+    await _reload_scheduled_jobs()
+    return {"status": "deleted", "id": job_id}
 
 
 # ----- Mail (Gmail) API - separate from Arc Reactor agents -----

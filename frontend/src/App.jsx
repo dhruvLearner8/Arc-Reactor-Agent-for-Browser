@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactFlow, {
   Background,
   Controls,
@@ -23,6 +23,30 @@ const statusColor = {
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/+$/, "");
 const apiUrl = (path) => (API_BASE_URL ? `${API_BASE_URL}${path}` : path);
+
+const SCHEDULER_RESULT_DRAWER_LS_KEY = "scheduler-result-drawer-width";
+const SCHEDULER_RESULT_DRAWER_MIN = 280;
+const SCHEDULER_RESULT_DRAWER_MAX = 720;
+const SCHEDULER_RESULT_DRAWER_DEFAULT = 440;
+
+function clampSchedulerResultDrawerWidth(w) {
+  const edge = typeof window !== "undefined" ? Math.max(SCHEDULER_RESULT_DRAWER_MIN, window.innerWidth - 16) : SCHEDULER_RESULT_DRAWER_MAX;
+  const cap = Math.min(SCHEDULER_RESULT_DRAWER_MAX, edge);
+  return Math.min(cap, Math.max(SCHEDULER_RESULT_DRAWER_MIN, Math.round(Number(w))));
+}
+
+function readSchedulerResultDrawerWidth() {
+  if (typeof window === "undefined") return SCHEDULER_RESULT_DRAWER_DEFAULT;
+  try {
+    const raw = localStorage.getItem(SCHEDULER_RESULT_DRAWER_LS_KEY);
+    if (raw == null) return SCHEDULER_RESULT_DRAWER_DEFAULT;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return SCHEDULER_RESULT_DRAWER_DEFAULT;
+    return clampSchedulerResultDrawerWidth(n);
+  } catch {
+    return SCHEDULER_RESULT_DRAWER_DEFAULT;
+  }
+}
 const SAMPLE_QUERIES = [
   "Plan a USA road trip from Canada with 3 friends under CAD 3,000 per person, including route, stays, activities, and budget split.",
   "What should I buy in 2026: gold or stocks? Do detailed research with macro trends, risks, scenarios, and a practical recommendation.",
@@ -317,6 +341,35 @@ function estimateRemainingSeconds(run, nowMs = Date.now()) {
   return Math.max(5, remaining);
 }
 
+/** Collect all URLs visited/referenced during a run from nodes + globals_schema */
+function extractUrlsFromRun(run) {
+  const seen = new Set();
+  const urlLike = (s) => typeof s === "string" && /^https?:\/\//i.test(s.trim());
+
+  function collect(val) {
+    if (!val) return;
+    if (typeof val === "string") {
+      if (urlLike(val)) seen.add(val.trim());
+      return;
+    }
+    if (Array.isArray(val)) {
+      val.forEach(collect);
+      return;
+    }
+    if (typeof val === "object") {
+      for (const v of Object.values(val)) collect(v);
+    }
+  }
+
+  for (const node of run?.nodes ?? []) {
+    collect(node?.output);
+  }
+  for (const v of Object.values(run?.globals_schema ?? {})) {
+    collect(v);
+  }
+  return Array.from(seen).filter(Boolean).sort();
+}
+
 function renderNodeOutput(node) {
   if (!node) return "Select a node to view details.";
   const normalizeString = (value) => {
@@ -504,6 +557,17 @@ function renderNodeOutput(node) {
   return objectToMarkdown(output);
 }
 
+/** Scheduler / “Load last run” — same markdown as Agent Run Preview (Formatter node, full pipeline). */
+function formatterMarkdownFromRunData(runData) {
+  if (!runData?.nodes?.length) return "";
+  const nodes = runData.nodes ?? [];
+  const formatter = nodes.find((n) => (n.agent || "").toLowerCase().includes("formatter"));
+  const fallback = [...nodes].reverse().find((n) => n.id !== "ROOT");
+  const node = formatter || fallback;
+  if (!node) return "";
+  return renderNodeOutput(node);
+}
+
 export default function App() {
   const [theme, setTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
@@ -557,6 +621,23 @@ export default function App() {
   const [mailCurrentPage, setMailCurrentPage] = useState(1);
   const [mailPageTokens, setMailPageTokens] = useState({}); // { 2: token, 3: token, ... } token to fetch that page
   const [mailNextPageToken, setMailNextPageToken] = useState(null); // from last response, for Next
+  const [scheduledJobs, setScheduledJobs] = useState([]);
+  const [schedulerLoading, setSchedulerLoading] = useState(false);
+  const [schedulerError, setSchedulerError] = useState("");
+  const [schedulerFormOpen, setSchedulerFormOpen] = useState(false);
+  const [schedulerForm, setSchedulerForm] = useState({
+    name: "",
+    subject: "jobs",
+    params: {},
+    schedule_type: "cron",
+    cron_expr: "0 7 * * *",
+    interval_minutes: 60,
+  });
+  const [editingJobId, setEditingJobId] = useState(null);
+  /** Per job: loading label, error, markdown results, run id */
+  const [schedulerUiByJobId, setSchedulerUiByJobId] = useState({});
+  const [schedulerResultDrawerJobId, setSchedulerResultDrawerJobId] = useState(null);
+  const [schedulerDrawerWidth, setSchedulerDrawerWidth] = useState(readSchedulerResultDrawerWidth);
   const noteEditorRef = useRef(null);
   const lastSavedContentByIdRef = useRef({});
   const inlineCreateSubmittingRef = useRef(false);
@@ -568,6 +649,7 @@ export default function App() {
     () => runDetail?.nodes?.find((n) => n.id === selectedNodeId),
     [runDetail, selectedNodeId]
   );
+  const runUrls = useMemo(() => extractUrlsFromRun(runDetail), [runDetail]);
   const selectedRunMeta = useMemo(
     () => runs.find((r) => r.run_id === selectedRunId) ?? null,
     [runs, selectedRunId]
@@ -1173,6 +1255,297 @@ export default function App() {
     }
   }, [activeSection, accessToken, mailFilter]);
 
+  async function fetchScheduledJobs() {
+    if (!accessToken) return;
+    setSchedulerLoading(true);
+    setSchedulerError("");
+    try {
+      const res = await fetch(apiUrl("/api/scheduled-jobs"), { headers: getAuthHeaders() });
+      if (!res.ok) throw new Error(await readErrorMessage(res, "Failed to load scheduled jobs"));
+      const data = await res.json();
+      setScheduledJobs(Array.isArray(data) ? data : []);
+    } catch (e) {
+      setSchedulerError(String(e));
+      setScheduledJobs([]);
+    } finally {
+      setSchedulerLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (activeSection === "scheduler" && accessToken) fetchScheduledJobs();
+  }, [activeSection, accessToken]);
+
+  useEffect(() => {
+    if (activeSection !== "scheduler") setSchedulerResultDrawerJobId(null);
+  }, [activeSection]);
+
+  useEffect(() => {
+    if (!schedulerResultDrawerJobId) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") setSchedulerResultDrawerJobId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [schedulerResultDrawerJobId]);
+
+  useEffect(() => {
+    if (!schedulerResultDrawerJobId) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [schedulerResultDrawerJobId]);
+
+  useEffect(() => {
+    function onWinResize() {
+      setSchedulerDrawerWidth((w) => clampSchedulerResultDrawerWidth(w));
+    }
+    window.addEventListener("resize", onWinResize);
+    return () => window.removeEventListener("resize", onWinResize);
+  }, []);
+
+  const beginSchedulerDrawerResize = useCallback((e) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startW = schedulerDrawerWidth;
+    const latest = { current: startW };
+    const pointerId = e.pointerId;
+    const target = e.currentTarget;
+
+    function move(ev) {
+      const delta = startX - ev.clientX;
+      const next = clampSchedulerResultDrawerWidth(startW + delta);
+      latest.current = next;
+      setSchedulerDrawerWidth(next);
+    }
+    function end() {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      try {
+        target.releasePointerCapture(pointerId);
+      } catch {
+        /* ignore */
+      }
+      try {
+        localStorage.setItem(SCHEDULER_RESULT_DRAWER_LS_KEY, String(latest.current));
+      } catch {
+        /* ignore */
+      }
+    }
+
+    try {
+      target.setPointerCapture(pointerId);
+    } catch {
+      /* ignore */
+    }
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+  }, [schedulerDrawerWidth]);
+
+  function onSchedulerDrawerResizeKeyDown(e) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const step = 24;
+    const delta = e.key === "ArrowLeft" ? step : -step;
+    setSchedulerDrawerWidth((w) => {
+      const next = clampSchedulerResultDrawerWidth(w + delta);
+      try {
+        localStorage.setItem(SCHEDULER_RESULT_DRAWER_LS_KEY, String(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }
+
+  function patchSchedulerJobUi(jobId, patch) {
+    setSchedulerUiByJobId((prev) => ({
+      ...prev,
+      [jobId]: { ...prev[jobId], ...patch },
+    }));
+  }
+
+  async function createScheduledJob() {
+    if (!accessToken) return;
+    setSchedulerError("");
+    try {
+      const payload = {
+        name: schedulerForm.name || "Scheduled Job",
+        subject: schedulerForm.subject,
+        params: schedulerForm.params,
+        schedule_type: schedulerForm.schedule_type,
+      };
+      if (schedulerForm.schedule_type === "cron") {
+        payload.cron_expr = schedulerForm.cron_expr || "0 7 * * *";
+      } else {
+        payload.interval_minutes = schedulerForm.interval_minutes || 60;
+      }
+      const res = await fetch(apiUrl("/api/scheduled-jobs"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(await readErrorMessage(res, "Failed to create job"));
+      const created = await res.json();
+      setSchedulerFormOpen(false);
+      setSchedulerForm({ name: "", subject: "jobs", params: {}, schedule_type: "cron", cron_expr: "0 7 * * *", interval_minutes: 60 });
+      if (created?.id) {
+        setScheduledJobs((prev) => {
+          const rest = prev.filter((x) => x.id !== created.id);
+          return [created, ...rest];
+        });
+        patchSchedulerJobUi(created.id, { markdown: "", error: "", loading: "" });
+      }
+      await fetchScheduledJobs();
+    } catch (e) {
+      setSchedulerError(String(e));
+    }
+  }
+
+  async function updateScheduledJob(jobId) {
+    if (!accessToken || !jobId) return;
+    setSchedulerError("");
+    try {
+      const payload = {};
+      if (schedulerForm.name != null) payload.name = schedulerForm.name;
+      if (schedulerForm.subject != null) payload.subject = schedulerForm.subject;
+      if (schedulerForm.params != null) payload.params = schedulerForm.params;
+      if (schedulerForm.schedule_type != null) payload.schedule_type = schedulerForm.schedule_type;
+      if (schedulerForm.schedule_type === "cron") payload.cron_expr = schedulerForm.cron_expr;
+      else payload.interval_minutes = schedulerForm.interval_minutes;
+      const res = await fetch(apiUrl(`/api/scheduled-jobs/${jobId}`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(await readErrorMessage(res, "Failed to update job"));
+      setSchedulerFormOpen(false);
+      setEditingJobId(null);
+      await fetchScheduledJobs();
+    } catch (e) {
+      setSchedulerError(String(e));
+    }
+  }
+
+  async function deleteScheduledJob(jobId) {
+    if (!accessToken || !jobId) return;
+    setSchedulerError("");
+    try {
+      const res = await fetch(apiUrl(`/api/scheduled-jobs/${jobId}`), { method: "DELETE", headers: getAuthHeaders() });
+      if (!res.ok) throw new Error(await readErrorMessage(res, "Failed to delete job"));
+      setSchedulerResultDrawerJobId((openId) => (openId === jobId ? null : openId));
+      setSchedulerUiByJobId((prev) => {
+        const next = { ...prev };
+        delete next[jobId];
+        return next;
+      });
+      await fetchScheduledJobs();
+    } catch (e) {
+      setSchedulerError(String(e));
+    }
+  }
+
+  async function runSchedulerJobNow(jobId) {
+    if (!accessToken || !jobId) return;
+    patchSchedulerJobUi(jobId, { loading: "Starting run…", error: "", markdown: "" });
+    try {
+      const res = await fetch(apiUrl(`/api/scheduled-jobs/${jobId}/run-now`), {
+        method: "POST",
+        headers: getAuthHeaders(),
+      });
+      if (!res.ok) throw new Error(await readErrorMessage(res, "Failed to start run"));
+      const data = await res.json();
+      const runId = data.run_id;
+      patchSchedulerJobUi(jobId, { loading: "Agent is working (this can take several minutes)…", runId });
+      await fetchScheduledJobs();
+      const maxWaitMs = 14 * 60 * 1000;
+      const start = Date.now();
+      while (Date.now() - start < maxWaitMs) {
+        const r = await fetch(apiUrl(`/api/runs/${runId}`), { headers: getAuthHeaders() });
+        if (!r.ok) throw new Error(await readErrorMessage(r, "Failed to load run status"));
+        const snap = await r.json();
+        if (snap.pending_clarification) {
+          patchSchedulerJobUi(jobId, {
+            loading: "",
+            error:
+              "This run needs your input in Agent Run (clarification). Answer there, then use Load last run here.",
+            markdown: formatterMarkdownFromRunData(snap) || "",
+          });
+          return;
+        }
+        if (snap.status === "completed") {
+          const md = formatterMarkdownFromRunData(snap);
+          patchSchedulerJobUi(jobId, {
+            loading: "",
+            markdown:
+              md ||
+              "_Run finished but no formatter text was found. Open Agent Run, select this run, and inspect the Formatter node._",
+            error: "",
+          });
+          return;
+        }
+        if (snap.status === "failed") {
+          patchSchedulerJobUi(jobId, {
+            loading: "",
+            error: snap.error || "Run failed",
+            markdown: "",
+          });
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+      }
+      patchSchedulerJobUi(jobId, {
+        loading: "",
+        error: "Still running after 14 minutes. Open Agent Run and select this run to watch progress.",
+      });
+    } catch (e) {
+      patchSchedulerJobUi(jobId, { loading: "", error: String(e) });
+    }
+  }
+
+  async function loadLastSchedulerRun(jobId, lastRunId) {
+    if (!accessToken || !lastRunId) return;
+    patchSchedulerJobUi(jobId, { loading: "Loading results…", error: "" });
+    try {
+      const r = await fetch(apiUrl(`/api/runs/${lastRunId}`), { headers: getAuthHeaders() });
+      if (!r.ok) throw new Error(await readErrorMessage(r, "Failed to load run"));
+      const snap = await r.json();
+      const md = formatterMarkdownFromRunData(snap);
+      if (snap.status === "failed") {
+        patchSchedulerJobUi(jobId, {
+          loading: "",
+          error: snap.error || "Run failed",
+          markdown: md || "",
+        });
+        return;
+      }
+      if (snap.status === "running" || snap.status === "queued" || snap.status === "starting") {
+        patchSchedulerJobUi(jobId, {
+          loading: "",
+          markdown:
+            md ||
+            "_This run is still in progress. Use Run now to follow a fresh run, or wait and click Load last run again._",
+          error: "",
+        });
+        return;
+      }
+      patchSchedulerJobUi(jobId, {
+        loading: "",
+        markdown:
+          md ||
+          "_No formatter output yet. When the run completes, click **Load last run** again._",
+        error: "",
+      });
+    } catch (e) {
+      patchSchedulerJobUi(jobId, { loading: "", error: String(e) });
+    }
+  }
 
   const lastEditorTabIdRef = useRef("");
   useEffect(() => {
@@ -1588,7 +1961,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""} ${activeSection === "notes" ? "notes-mode" : ""} ${activeSection === "mail" ? "mail-mode" : ""}`}>
+      <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""} ${activeSection === "notes" ? "notes-mode" : ""} ${activeSection === "mail" ? "mail-mode" : ""} ${activeSection === "scheduler" ? "scheduler-mode" : ""}`}>
         <aside className="left-nav-rail">
           <button
             className={`rail-icon-btn ${activeSection === "run" ? "active" : ""}`}
@@ -1610,6 +1983,13 @@ export default function App() {
             title="Mail"
           >
             ✉
+          </button>
+          <button
+            className={`rail-icon-btn ${activeSection === "scheduler" ? "active" : ""}`}
+            onClick={() => setActiveSection("scheduler")}
+            title="Scheduler"
+          >
+            ⏰
           </button>
         </aside>
         {activeSection === "run" ? (
@@ -1836,10 +2216,33 @@ export default function App() {
                 >
                   JSON
                 </button>
+                <button
+                  className={viewMode === "urls" ? "active-tab" : ""}
+                  onClick={() => setViewMode("urls")}
+                >
+                  Web URLs
+                </button>
               </div>
               <div className="markdown-view">
                 {viewMode === "json" ? (
                   <pre>{JSON.stringify(selectedNode?.output ?? {}, null, 2)}</pre>
+                ) : viewMode === "urls" ? (
+                  <div className="urls-list">
+                    {runUrls.map((url, i) => (
+                      <a
+                        key={i}
+                        href={url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="url-link"
+                      >
+                        {url}
+                      </a>
+                    ))}
+                    {runUrls.length === 0 ? (
+                      <span className="urls-empty">No URLs visited in this run.</span>
+                    ) : null}
+                  </div>
                 ) : (
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>
                     {renderNodeOutput(selectedNode)}
@@ -2044,6 +2447,307 @@ export default function App() {
                 </div>
               </div>
             </div>
+          </main>
+        ) : activeSection === "scheduler" ? (
+          <main className="scheduler-panel">
+            <div className="scheduler-header">
+              <span className="scheduler-title">Scheduler</span>
+              <button
+                className="scheduler-add-btn"
+                onClick={() => {
+                  setSchedulerResultDrawerJobId(null);
+                  setSchedulerForm({ name: "", subject: "jobs", params: {}, schedule_type: "cron", cron_expr: "0 7 * * *", interval_minutes: 60 });
+                  setEditingJobId(null);
+                  setSchedulerFormOpen(true);
+                }}
+                type="button"
+              >
+                + Add Job
+              </button>
+            </div>
+            {schedulerError ? <div className="scheduler-error">{schedulerError}</div> : null}
+            <div className="scheduler-content">
+              {schedulerLoading ? (
+                <div className="scheduler-loading">Loading...</div>
+              ) : scheduledJobs.length === 0 ? (
+                <div className="scheduler-empty">
+                  No scheduled jobs. Add one to run tasks automatically (e.g. SK job boards at 7am, weather, stocks, news).
+                </div>
+              ) : (
+                <div className="scheduler-job-grid">
+                  {scheduledJobs.map((job) => {
+                    const ui = schedulerUiByJobId[job.id] || {};
+                    const builtQuery = job.built_query || "";
+                    return (
+                      <div key={job.id} className="scheduler-job-card">
+                        <div className="scheduler-job-card-body">
+                          <span className="scheduler-job-name">{job.name || "Untitled"}</span>
+                          <span className="scheduler-job-subject">{job.subject}</span>
+                          <span className="scheduler-job-schedule">
+                            {job.schedule_type === "cron"
+                              ? `Cron: ${job.cron_expr || "-"} (scheduler uses America/Regina unless SCHEDULER_TIMEZONE is set on the server)`
+                              : `Every ${job.interval_minutes || 60} min`}
+                          </span>
+                          {job.params?.qualification ? (
+                            <span className="scheduler-job-param">Qualification: {job.params.qualification}</span>
+                          ) : null}
+                          {job.params?.location ? (
+                            <span className="scheduler-job-param">Location: {job.params.location}</span>
+                          ) : null}
+                          {job.params?.ticker ? (
+                            <span className="scheduler-job-param">Ticker: {job.params.ticker}</span>
+                          ) : null}
+                          {job.params?.topic ? (
+                            <span className="scheduler-job-param">Topic: {job.params.topic}</span>
+                          ) : null}
+                          {job.enabled === false ? <span className="scheduler-job-disabled">Disabled</span> : null}
+                          <div className="scheduler-query-box">
+                            <div className="scheduler-query-label">Query sent to the agent</div>
+                            <pre className="scheduler-query-text">{builtQuery || "(empty)"}</pre>
+                            <p className="scheduler-query-hint">
+                              Scheduled runs use this text. Cron jobs only fire at the set time — use <strong>Run now</strong> to fetch
+                              results immediately.
+                            </p>
+                          </div>
+                          {ui.loading ? <div className="scheduler-run-status">{ui.loading}</div> : null}
+                          {ui.error ? <div className="scheduler-run-error">{ui.error}</div> : null}
+                        </div>
+                        <div className="scheduler-job-card-actions">
+                          <button
+                            className="scheduler-job-btn scheduler-job-primary"
+                            disabled={!!ui.loading}
+                            onClick={() => runSchedulerJobNow(job.id)}
+                            type="button"
+                          >
+                            Run now
+                          </button>
+                          {job.last_run_id ? (
+                            <button
+                              className="scheduler-job-btn"
+                              disabled={!!ui.loading}
+                              onClick={() => loadLastSchedulerRun(job.id, job.last_run_id)}
+                              type="button"
+                            >
+                              Load last run
+                            </button>
+                          ) : null}
+                          {String(ui.markdown || "").trim() ? (
+                            <button
+                              className="scheduler-job-btn"
+                              onClick={() => setSchedulerResultDrawerJobId(job.id)}
+                              type="button"
+                            >
+                              View result
+                            </button>
+                          ) : null}
+                          <button
+                            className="scheduler-job-btn"
+                            onClick={() => {
+                              setSchedulerResultDrawerJobId(null);
+                              setSchedulerForm({
+                                name: job.name || "",
+                                subject: job.subject || "jobs",
+                                params: job.params || {},
+                                schedule_type: job.schedule_type || "cron",
+                                cron_expr: job.cron_expr || "0 7 * * *",
+                                interval_minutes: job.interval_minutes || 60,
+                              });
+                              setEditingJobId(job.id);
+                              setSchedulerFormOpen(true);
+                            }}
+                            type="button"
+                          >
+                            Edit
+                          </button>
+                          <button className="scheduler-job-btn scheduler-job-delete" onClick={() => deleteScheduledJob(job.id)} type="button">
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+            {schedulerFormOpen ? (
+              <div className="scheduler-form-overlay">
+                <div className="scheduler-form-box">
+                  <h3>{editingJobId ? "Edit Job" : "Add Scheduled Job"}</h3>
+                  <div className="scheduler-form-row">
+                    <label>Name</label>
+                    <input
+                      value={schedulerForm.name}
+                      onChange={(e) => setSchedulerForm((f) => ({ ...f, name: e.target.value }))}
+                      placeholder="e.g. SK Jobs 7am"
+                    />
+                  </div>
+                  <div className="scheduler-form-row">
+                    <label>Subject</label>
+                    <select
+                      value={schedulerForm.subject}
+                      onChange={(e) => setSchedulerForm((f) => ({ ...f, subject: e.target.value }))}
+                    >
+                      <option value="jobs">Jobs (SK Crown / gov sites)</option>
+                      <option value="weather">Weather</option>
+                      <option value="stocks">Stocks</option>
+                      <option value="news">News</option>
+                      <option value="custom">Custom query</option>
+                    </select>
+                  </div>
+                  {schedulerForm.subject === "jobs" ? (
+                    <div className="scheduler-form-row">
+                      <label>Qualification / keywords</label>
+                      <input
+                        value={schedulerForm.params?.qualification ?? ""}
+                        onChange={(e) => setSchedulerForm((f) => ({ ...f, params: { ...f.params, qualification: e.target.value } }))}
+                        placeholder="e.g. Software Engineer, Data Analyst"
+                      />
+                    </div>
+                  ) : null}
+                  {schedulerForm.subject === "weather" ? (
+                    <div className="scheduler-form-row">
+                      <label>Location</label>
+                      <input
+                        value={schedulerForm.params?.location ?? ""}
+                        onChange={(e) => setSchedulerForm((f) => ({ ...f, params: { ...f.params, location: e.target.value } }))}
+                        placeholder="e.g. Saskatoon, Saskatchewan"
+                      />
+                    </div>
+                  ) : null}
+                  {schedulerForm.subject === "stocks" ? (
+                    <div className="scheduler-form-row">
+                      <label>Ticker</label>
+                      <input
+                        value={schedulerForm.params?.ticker ?? ""}
+                        onChange={(e) => setSchedulerForm((f) => ({ ...f, params: { ...f.params, ticker: e.target.value } }))}
+                        placeholder="e.g. SPY, AAPL"
+                      />
+                    </div>
+                  ) : null}
+                  {schedulerForm.subject === "news" ? (
+                    <div className="scheduler-form-row">
+                      <label>Topic</label>
+                      <input
+                        value={schedulerForm.params?.topic ?? ""}
+                        onChange={(e) => setSchedulerForm((f) => ({ ...f, params: { ...f.params, topic: e.target.value } }))}
+                        placeholder="e.g. AI, Saskatchewan tech"
+                      />
+                    </div>
+                  ) : null}
+                  {schedulerForm.subject === "custom" ? (
+                    <div className="scheduler-form-row">
+                      <label>Query</label>
+                      <textarea
+                        rows={3}
+                        value={schedulerForm.params?.query ?? ""}
+                        onChange={(e) => setSchedulerForm((f) => ({ ...f, params: { ...f.params, query: e.target.value } }))}
+                        placeholder="Any research query..."
+                      />
+                    </div>
+                  ) : null}
+                  <div className="scheduler-form-row">
+                    <label>Schedule</label>
+                    <select
+                      value={schedulerForm.schedule_type}
+                      onChange={(e) => setSchedulerForm((f) => ({ ...f, schedule_type: e.target.value }))}
+                    >
+                      <option value="cron">Daily at fixed time (cron)</option>
+                      <option value="interval">Every N minutes</option>
+                    </select>
+                  </div>
+                  {schedulerForm.schedule_type === "cron" ? (
+                    <div className="scheduler-form-row">
+                      <label>Cron (min hour day month dow)</label>
+                      <input
+                        value={schedulerForm.cron_expr}
+                        onChange={(e) => setSchedulerForm((f) => ({ ...f, cron_expr: e.target.value }))}
+                        placeholder="0 7 * * * = 7am daily"
+                      />
+                    </div>
+                  ) : (
+                    <div className="scheduler-form-row">
+                      <label>Interval (minutes)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={10080}
+                        value={schedulerForm.interval_minutes}
+                        onChange={(e) => setSchedulerForm((f) => ({ ...f, interval_minutes: parseInt(e.target.value, 10) || 60 }))}
+                      />
+                    </div>
+                  )}
+                  <div className="scheduler-form-actions">
+                    <button onClick={() => { setSchedulerFormOpen(false); setEditingJobId(null); }} type="button">Cancel</button>
+                    <button
+                      onClick={() => (editingJobId ? updateScheduledJob(editingJobId) : createScheduledJob())}
+                      type="button"
+                    >
+                      {editingJobId ? "Update" : "Create"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+            {schedulerResultDrawerJobId ? (
+              <>
+                <div
+                  className="scheduler-drawer-backdrop"
+                  role="presentation"
+                  onClick={() => setSchedulerResultDrawerJobId(null)}
+                />
+                <aside
+                  className="scheduler-result-drawer"
+                  style={{ width: schedulerDrawerWidth }}
+                  aria-labelledby="scheduler-drawer-title"
+                  aria-modal="true"
+                  role="dialog"
+                >
+                  <div
+                    className="scheduler-result-drawer-resize"
+                    onPointerDown={beginSchedulerDrawerResize}
+                    onKeyDown={onSchedulerDrawerResizeKeyDown}
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-valuenow={schedulerDrawerWidth}
+                    aria-valuemin={SCHEDULER_RESULT_DRAWER_MIN}
+                    aria-valuemax={Math.min(
+                      SCHEDULER_RESULT_DRAWER_MAX,
+                      typeof window !== "undefined" ? window.innerWidth - 16 : SCHEDULER_RESULT_DRAWER_MAX
+                    )}
+                    aria-label="Resize result panel width"
+                    title={`Drag to resize (${SCHEDULER_RESULT_DRAWER_MIN}–${SCHEDULER_RESULT_DRAWER_MAX}px max)`}
+                    tabIndex={0}
+                  />
+                  <div className="scheduler-result-drawer-stack">
+                    <div className="scheduler-result-drawer-header">
+                      <div className="scheduler-result-drawer-titles">
+                        <h3 id="scheduler-drawer-title">Result</h3>
+                        <span className="scheduler-result-drawer-job">
+                          {scheduledJobs.find((j) => j.id === schedulerResultDrawerJobId)?.name || "Scheduled job"}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="scheduler-result-drawer-close"
+                        onClick={() => setSchedulerResultDrawerJobId(null)}
+                        aria-label="Close"
+                      >
+                        ×
+                      </button>
+                    </div>
+                    <div className="scheduler-result-drawer-body markdown-view">
+                      {String(schedulerUiByJobId[schedulerResultDrawerJobId]?.markdown || "").trim() ? (
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {schedulerUiByJobId[schedulerResultDrawerJobId].markdown}
+                        </ReactMarkdown>
+                      ) : (
+                        <p className="scheduler-result-drawer-empty">No output loaded yet. Use Run now or Load last run.</p>
+                      )}
+                    </div>
+                  </div>
+                </aside>
+              </>
+            ) : null}
           </main>
         ) : (
           <main className="notes-panel">
