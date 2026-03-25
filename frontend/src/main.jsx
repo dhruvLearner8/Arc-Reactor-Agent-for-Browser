@@ -4,6 +4,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import App from "./App";
 import HomePage from "./HomePage";
 import LoginPage from "./LoginPage";
+import AuthCallback from "./AuthCallback";
 import { supabase } from "./lib/supabase";
 import "./styles.css";
 import "reactflow/dist/style.css";
@@ -68,6 +69,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(
       <Routes>
         <Route path="/" element={<HomePage />} />
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/auth/callback" element={<AuthCallback />} />
         <Route
           path="/agent"
           element={

@@ -40,7 +40,9 @@ export default function LoginPage() {
     localStorage.removeItem("arc_guest_session_id");
     const { error: signInError } = await supabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo: `${window.location.origin}/agent` },
+      options: {
+        redirectTo: `${window.location.origin}/auth/callback`,
+      },
     });
     if (signInError) setError(signInError.message);
   }
