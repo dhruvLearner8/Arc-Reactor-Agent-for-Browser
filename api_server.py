@@ -2352,7 +2352,11 @@ async def list_runs(current_user: AuthUser = Depends(get_current_user)) -> list[
         )
 
     persisted: list[dict[str, Any]] = []
-    if LOCAL_RUN_STORE:
+    # Guests use sub like "guest:<uuid>"; Supabase owner_user_id is a real UUID — never query DB for guests.
+    if current_user.is_guest:
+        local_rows = _list_local_run_records(current_user.user_id)
+        persisted.extend(_db_row_to_run_list_item(row) for row in local_rows)
+    elif LOCAL_RUN_STORE:
         local_rows = _list_local_run_records(current_user.user_id)
         persisted.extend(_db_row_to_run_list_item(row) for row in local_rows)
     else:
@@ -2384,8 +2388,12 @@ async def get_run(run_id: str, current_user: AuthUser = Depends(get_current_user
             detail["activity"] = RUNS[run_id].get("activity", [])[:50]
         return detail
 
-    # Persisted history.
+    # Persisted history (guests: local files only; never Supabase — invalid UUID FK).
     if LOCAL_RUN_STORE:
+        local_row = _load_local_run_record(run_id)
+        if local_row and local_row.get("owner_user_id") == current_user.user_id:
+            return _db_row_to_run_detail(local_row)
+    elif current_user.is_guest:
         local_row = _load_local_run_record(run_id)
         if local_row and local_row.get("owner_user_id") == current_user.user_id:
             return _db_row_to_run_detail(local_row)
