@@ -1,326 +1,350 @@
-# Arc Reactor - Multi-Agent DAG Architecture
+# Arc Reactor
 
-Arc Reactor is a production-oriented multi-agent system built around a directed acyclic graph (DAG) execution model.  
-It combines a FastAPI backend, a React/ReactFlow frontend, MCP tool servers, and session-aware persistence for replayable run histories.
+**Arc Reactor** is a production-oriented **multi-agent research system** built around a **directed acyclic graph (DAG)**. Users ask complex questions; a **Planner** turns them into an executable graph of specialized agents (retrieve, reason, distill, QA, format). The stack is **FastAPI** + **React / React Flow** + **MCP tool servers**, with optional **Supabase** persistence and **per-user Gmail**.
 
-This README documents the **current architecture** , with emphasis on how planning, execution, streaming, and storage work together.
+For a **code navigation map** (where to edit what), see **[`AGENT_README.md`](./AGENT_README.md)**.
 
 ---
-# Demo - 1
 
-https://drive.google.com/file/d/1vt172Q0vzhBNi5NEmVYDxuZcMlvBef92/view?usp=sharing
+## Demos
 
-# Demo - 2
+- **Demo 1:** [Google Drive](https://drive.google.com/file/d/1vt172Q0vzhBNi5NEmVYDxuZcMlvBef92/view?usp=sharing)  
+- **Demo 2:** [YouTube](https://youtu.be/wYQjWFYDFOg)
 
-https://youtu.be/wYQjWFYDFOg
+---
 
-## Table of Contents
+## Table of contents
 
-- [What This System Does](#what-this-system-does)
-- [Architecture Overview](#architecture-overview)
-- [Execution Lifecycle (Step-by-Step)](#execution-lifecycle-step-by-step)
-- [Core Data Contracts](#core-data-contracts)
-- [Storage and Persistence Modes](#storage-and-persistence-modes)
-- [Frontend Architecture](#frontend-architecture)
-- [Authentication Model](#authentication-model)
-- [API Endpoints](#api-endpoints)
+- [Features](#features)
+- [Architecture (diagrams)](#architecture-diagrams)
+- [What this system does](#what-this-system-does)
+- [Execution lifecycle](#execution-lifecycle-step-by-step)
+- [Core data contracts](#core-data-contracts)
+- [Storage and persistence](#storage-and-persistence-modes)
+- [Frontend](#frontend-architecture)
+- [Authentication](#authentication-model)
+- [API surface](#api-endpoints)
 - [Configuration](#configuration)
-- [Run Locally](#run-locally)
-- [Render + Supabase Setup](#render--supabase-setup)
-- [Project Structure](#project-structure)
+- [Run locally](#run-locally)
+- [Deploy (Render + Supabase + Vercel)](#render--supabase--vercel)
+- [Project structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
 
 ---
 
-## What This System Does
+## Features
 
-- Converts a user query into a DAG of agent tasks (Planner-first).
-- Executes independent DAG nodes in parallel when dependencies are satisfied.
-- Allows iterative tool usage (`call_tool`) and self-reasoning/code execution (`call_self`) per node.
-- Streams live run snapshots to the UI via SSE.
-- Persists run history and node outputs for replay/debug (local and/or Supabase, based on config).
+| Area | What you get |
+|------|----------------|
+| **Agent run** | Planner-first DAG; parallel execution of ready steps; live graph in **React Flow**. |
+| **Streaming** | **SSE** with short-lived stream tickets; snapshot hydration on connect. |
+| **Inspector** | **Preview** / **Rendered** / **JSON** / **Web URLs** tabs; markdown rendering with GFM. |
+| **Clarification** | Pipeline can pause for user input; resume via clarification API. |
+| **Research follow-up** | **Formatter follow-up** appends a new subgraph in the **same** run for “tell me more” style queries. |
+| **MCP tools** | Browser, retrieval, sandbox-style tooling via **MultiMCP** (`mcp_servers/`). |
+| **Scheduler** | Cron / interval **scheduled jobs**; server-built `built_query`; **run now** from UI. |
+| **Notepad** | Per-user notes (folders + markdown files); cloud table when Supabase store is enabled. |
+| **Mail** | **Per-user Gmail OAuth**; connect/disconnect; list/read/send/reply (not a shared server mailbox). |
+| **Auth** | **Supabase** JWT for signed-in users; **guest** mode with run quota (limited runs, no Mail/scheduler cloud features that require full account). |
+| **Persistence** | **Local** JSON under `memory/` and/or **Supabase** (`chat_runs`, jobs, notepad, Gmail credentials) depending on env. |
 
 ---
 
-## Architecture Overview
+## Architecture (diagrams)
 
-### High-level flow
+### 1) System context — who talks to whom
 
-1. User submits query (`POST /api/runs`).
-2. Backend creates a run record and spawns async execution.
-3. `PlannerAgent` produces a plan graph (`nodes` + `edges` + reads/writes contracts).
-4. `ExecutionContextManager` materializes a NetworkX DAG.
-5. Ready nodes execute via `AgentLoop4`, with tool/call-self loops as needed.
-6. Node outputs are merged into `globals_schema` for downstream dependencies.
-7. Snapshots are streamed to clients and persisted.
-8. Run completes with summary, final snapshot, and status.
+High-level view: browser, static frontend host, API on Render, Supabase, LLM, and Google (sign-in + optional Gmail).
 
-### Architecture flow diagram
+```mermaid
+flowchart TB
+  subgraph Users["Users"]
+    U[Browser]
+  end
 
-```text
-┌────────────────────────────────────────────────────────────────────────────┐
-│                              Frontend (React)                              │
-│                                                                            │
-│  New Run Query Input  ->  POST /api/runs                                  │
-│  Run Graph + Inspector  <-  SSE: run_update / run_complete / run_error    │
-└────────────────────────────────────────────────────────────────────────────┘
-                                   │
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                         FastAPI Backend (api_server.py)                    │
-│                                                                            │
-│  1) Auth check (auth.py)                                                   │
-│  2) Create run state + async _execute_run                                  │
-│  3) Stream snapshots to UI                                                 │
-│  4) Persist run/session history                                            │
-└────────────────────────────────────────────────────────────────────────────┘
-                                   │
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                 Agent Orchestration (AgentLoop4 + NetworkX DAG)            │
-│                                                                            │
-│  PlannerAgent -> builds DAG (nodes + dependencies)                         │
-│                                                                            │
-│  Core execution path:                                                      │
-│    Planner -> Retriever -> Thinker -> Distiller -> Formatter -> Summarizer│
-│                                                                            │
-│  Validation loop:                                                          │
-│    if retrieved data is weak/missing -> Retriever retries with tools       │
-│                                                                            │
-│  Node loop behavior:                                                       │
-│    - call_tool  -> query MCP tools                                         │
-│    - call_self  -> self-iterate / run generated code                       │
-└────────────────────────────────────────────────────────────────────────────┘
-                                   │
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                              Tool Layer (MCP)                              │
-│                                                                            │
-│  Browser tools | RAG/Search tools | Sandbox execution tools                │
-│  (via MultiMCP router)                                                     │
-└────────────────────────────────────────────────────────────────────────────┘
-                                   │
-                                   ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                                Data Stores                                 │
-│                                                                            │
-│  memory/local_runs/                     (run index/history)                │
-│  memory/session_summaries_index/YYYY/MM/DD/ (full DAG snapshots)           │
-│  Supabase chat_runs/app_users/app_logs   (optional cloud persistence)      │
-└────────────────────────────────────────────────────────────────────────────┘
+  subgraph CDN["Frontend hosting"]
+    FE["Static SPA (Vercel / custom domain)"]
+  end
+
+  subgraph APIHost["API hosting"]
+    API["FastAPI api_server.py (e.g. Render)"]
+  end
+
+  subgraph Data["Data plane"]
+    SB[(Supabase Postgres and Auth)]
+    MEM["Local disk: memory/ runs, sessions, jobs merge"]
+  end
+
+  subgraph LLM["Models"]
+    GM["LLM APIs (e.g. Gemini)"]
+  end
+
+  subgraph Google["Google Cloud"]
+    GSI["OAuth: Sign-in → Supabase auth/v1/callback"]
+    GMAIL["OAuth: Gmail → API /api/mail/oauth/callback"]
+  end
+
+  U --> FE
+  FE -->|"REST + SSE, Bearer JWT"| API
+  FE -->|"Supabase client (session)"| SB
+  API -->|"service role REST"| SB
+  API --> MEM
+  API --> GM
+  FE --> GSI
+  API --> GMAIL
 ```
 
-Simple mental model: **Plan -> Retrieve (loop if needed) -> Think -> Distill -> Format -> Summarize**.
+### 2) Single research run — request to completion
 
-### Main backend components
+Logical path from “user sends query” to “UI shows final graph.”
 
-| Component | File | Responsibility |
-|---|---|---|
-| API layer | `api_server.py` | Run creation/list/detail, stream tickets, SSE events, persistence routing |
-| Orchestrator | `core/loop.py` | `AgentLoop4` bootstrap, planning, DAG scheduling, step execution loops |
-| Context graph | `memory/context.py` | NetworkX DAG state, `mark_running/done/failed`, extraction, autosave |
-| Agent runner | `agents/base_agent.py` | Prompt/model execution, MCP tool schema injection, JSON parsing/retry |
-| Tool router | `mcp_servers/multi_mcp.py` | Starts MCP servers and routes tool calls |
-| Sandbox execution | `tools/sandbox.py` | Executes generated code safely with constrained globals |
-| Auth | `auth.py` | Bearer JWT verification (Supabase-compatible) |
+```mermaid
+flowchart LR
+  subgraph Client["Frontend"]
+    A[POST /api/runs]
+    B[GET stream-ticket]
+    C[EventSource /events]
+  end
 
-### Tooling layer (MCP)
+  subgraph Server["api_server.py"]
+    D[Create RUNS id]
+    E[_execute_run task]
+  end
 
-The system integrates multiple tool servers (for retrieval, browser/web tasks, and sandbox-like execution), with `MultiMCP` as the coordinator.
+  subgraph Orchestrator["core/loop.py — AgentLoop4"]
+    F[PlannerAgent → plan_graph]
+    G[ExecutionContextManager + NetworkX]
+    H[get_ready_steps loop]
+    I[AgentRunner per node]
+  end
+
+  subgraph Tools["MCP"]
+    J[MultiMCP → tools]
+  end
+
+  subgraph Out["Output"]
+    K[globals_schema + snapshot]
+    L[SSE run_update / complete]
+    M[Persist local / Supabase]
+  end
+
+  A --> D
+  D --> E
+  E --> F
+  F --> G
+  G --> H
+  H --> I
+  I --> J
+  J --> I
+  I --> K
+  K --> L
+  K --> M
+  B --> C
+  C --> L
+```
+
+### 3) DAG execution inside one run (mental model)
+
+How nodes relate; not every run uses every agent — the **Planner** chooses the graph.
+
+```mermaid
+flowchart TB
+  Q[User query] --> P[PlannerAgent]
+  P --> R[RetrieverAgent]
+  R --> T[ThinkerAgent]
+  T --> D[DistillerAgent]
+  D --> QA[QAAgent]
+  QA --> FMT[FormatterAgent]
+  FMT --> OUT[Final answer in snapshot]
+
+  R -.->|weak retrieval / tools| R
+
+  subgraph NodeLoop["Per-node loop"]
+    N1[Model output]
+    N2{control?}
+    N3[call_tool → MCP]
+    N4[call_self iterate]
+    N1 --> N2
+    N2 -->|tool| N3
+    N2 -->|self| N4
+    N3 --> N1
+    N4 --> N1
+  end
+```
+
+### 4) Authentication flows (two different Google OAuth uses)
+
+**Sign-in** goes through Supabase; **Mail** uses your API’s OAuth callback — different redirect URIs in Google Cloud.
+
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant SPA as React app
+  participant SB as Supabase Auth
+  participant GC as Google
+  participant API as FastAPI
+
+  Note over U,GC: A — Sign in with Google (session)
+  U->>SPA: Click Sign in
+  SPA->>SB: signInWithOAuth redirectTo /auth/callback
+  SB->>GC: OAuth
+  GC->>SB: return to …/auth/v1/callback
+  SB->>SPA: redirect …/auth/callback?code=
+  SPA->>SB: exchangeCodeForSession
+  SPA->>API: API calls with Bearer supabase_jwt
+
+  Note over U,API: B — Connect Gmail (per user)
+  U->>SPA: Mail → Connect Gmail
+  SPA->>API: POST /api/mail/oauth/begin
+  API->>GC: redirect user with Mail client
+  GC->>API: GET /api/mail/oauth/callback?code=
+  API->>SB: store refresh token in user_gmail_credentials
+```
 
 ---
 
-## Execution Lifecycle (Step-by-Step)
+## What this system does
+
+- Turns a natural-language **query** into a **DAG** of agent steps (Planner-first).
+- Runs **independent** steps in **parallel** when dependencies are satisfied.
+- Supports **tool calls** (`call_tool`) and **iteration** (`call_self`) inside a node until it completes.
+- Streams **live snapshots** to the UI over **SSE**.
+- Persists **run history** and supports **scheduled** re-runs, **notepad**, and **optional Gmail**.
+
+---
+
+## Execution lifecycle (step-by-step)
 
 ### 1) Run creation
 
-- `POST /api/runs`:
-  - validates auth user
-  - creates `run_id`
-  - initializes in-memory `RUNS[run_id]` state
-  - persists initial run metadata (local/Supabase)
-  - starts `_execute_run(...)` as background task
+- `POST /api/runs` validates auth, creates `run_id`, seeds `RUNS[run_id]`, persists metadata (per `LOCAL_RUN_STORE` / Supabase), starts `_execute_run` as a background task.
 
 ### 2) Bootstrap + planning
 
-- `_execute_run(...)` initializes MCP and `AgentLoop4`.
-- `AgentLoop4.run(...)` creates a bootstrap context and asks `PlannerAgent` for plan graph.
-- Graph is converted to NetworkX in `ExecutionContextManager`.
+- `AgentLoop4` initializes MCP and asks **PlannerAgent** for a `plan_graph` (nodes, edges, reads/writes).
+- Graph is loaded into **NetworkX** via `ExecutionContextManager`.
 
 ### 3) DAG execution
 
 - Scheduler repeatedly calls `get_ready_steps()`.
-- Ready nodes become `running` and execute concurrently.
-- Each node may:
-  - return final output,
-  - request `call_tool` (invoke MCP tool),
-  - request `call_self` (iterate with new instruction / code result).
+- Ready nodes run concurrently; each may finish, call tools, or self-loop.
 
-### 4) Output extraction and dependency propagation
+### 4) Dataflow
 
-- `mark_done(...)` writes outputs into `globals_schema` using declared `writes`.
-- Downstream nodes read only declared dependencies (`reads`), preserving isolation.
-- If extraction fails, fallback payloads are inserted so pipeline remains debuggable.
+- `mark_done` writes outputs into `globals_schema` under declared **writes** keys.
+- Downstream nodes read only their **reads** keys.
 
 ### 5) Live streaming
 
-- UI requests a short-lived stream ticket (`/api/runs/{id}/stream-ticket`).
-- UI opens `EventSource` on `/api/runs/{id}/events?ticket=...`.
-- Backend emits `run_update`, `run_complete`, `run_error`.
-- Latest snapshot is sent immediately on stream connect for fast hydration.
+- Client obtains a stream ticket, opens `EventSource` on `/api/runs/{id}/events`.
+- Server emits `run_update`, `run_complete`, `run_error`.
 
-### 6) Completion/failure
+### 6) Completion
 
-- On success: status set to `completed`, summary persisted, completion event published.
-- On failure/timeout: status set to `failed`, error persisted and streamed.
+- Success or failure is reflected in status, persisted, and streamed.
 
 ---
 
-## Core Data Contracts
+## Core data contracts
 
-### Run record (conceptual)
+### Run state (`RUNS[run_id]`)
 
-`RUNS[run_id]` typically contains:
+`query`, `status`, `summary`, `snapshot`, `session_id`, `owner_user_id`, `subscribers` (SSE), optional `pending_clarification`, `activity`.
 
-- `query`, `created_at`, `status`
-- `summary`
-- `snapshot` (latest graph state for UI)
-- `session_id`
-- `owner_user_id`, `owner_email`
-- `subscribers` (SSE queues)
-- optional `error`
+### Snapshot (API / UI)
 
-### Snapshot contract (used by API/UI)
+`run_id`, `query`, `status`, `nodes[]`, `links[]`, `globals_schema`, `session_id`, etc.
 
-- `run_id`
-- `query`
-- `created_at`
-- `status`
-- `nodes[]` (each with id/agent/status/reads/writes/output metadata)
-- `links[]` (`source`, `target`)
-- `globals_schema` (cross-node data)
-- `session_id` (when available)
+### Node output
 
-### Node output contract (flexible)
-
-Node `output` is model-dependent JSON and may include:
-
-- content keys (`final_answer`, `formatted_report_*`, etc.)
-- control keys (`call_tool`, `call_self`, tool params)
-- telemetry (`cost`, token counts)
-- execution results (`execution_result`, `execution_error`)
+Model-dependent JSON: content fields, `call_tool` / `call_self` controls, telemetry.
 
 ---
 
-## Storage and Persistence Modes
+## Storage and persistence modes
 
-### Local files
+| Mode | Behavior |
+|------|----------|
+| **Local runs** | `LOCAL_RUN_STORE=1` → run list/detail primarily from `memory/local_runs/`. |
+| **Supabase** | With URL + service role and `LOCAL_RUN_STORE` off → `chat_runs`, `app_users`, `app_logs`, plus scheduler/notepad tables when migrations are applied. |
+| **Guests** | `sub` like `guest:…` is not a DB UUID; guest run listing uses **local** run files only (no Supabase row query for that id). |
+| **Session files** | `SAVE_LOCAL_SESSIONS` controls extra session graph files under `memory/session_summaries_index/`. |
 
-- Run index files: `memory/local_runs/run_*.json`
-- Full session graph snapshots: `memory/session_summaries_index/YYYY/MM/DD/session_*.json`
-
-### Supabase mode
-
-- Uses `chat_runs`, `app_users`, and optional logs tables when enabled.
-
-### Mode selection
-
-- `LOCAL_RUN_STORE=1` -> prefer local run store.
-- Supabase used when configured and local-run mode is disabled.
-- Session-file persistence controlled via `SAVE_LOCAL_SESSIONS`.
+Migrations live in **`db/migrations/`** (including scheduled jobs, `user_gmail_credentials`, `user_notepad`).
 
 ---
 
-## Frontend Architecture
+## Frontend architecture
 
-Frontend lives in `frontend/` and is built with Vite + React.
-
-### Key behavior
-
-- Auth gate via Supabase session.
-- Run list + run detail loading from backend.
-- Live status updates through SSE ticket + EventSource.
-- Graph visualization through ReactFlow.
-- Inspector panel supports:
-  - rendered markdown mode
-  - raw JSON mode
-
-### Important rendering note
-
-Formatter outputs can contain both metadata fields and content fields.  
-Rendered mode should select content keys (e.g., rich report fields) rather than format metadata values.
+- **Vite + React** in `frontend/`.
+- **Routes:** home, login, **`/auth/callback`** (OAuth code exchange), **`/agent`** (gated app).
+- **Agent:** run list, React Flow graph, inspector tabs (**Preview / Rendered / JSON / Web URLs**), SSE.
+- **Notepad:** tabbed editor, autosave to API.
+- **Mail:** Gmail status, connect/disconnect, threads (per linked account).
+- **Scheduler:** job cards, **Run now**, cron/interval editing.
+- **Env (build time):** `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_API_BASE_URL`.
 
 ---
 
-## Authentication Model
+## Authentication model
 
-- Frontend obtains Supabase access token.
-- Backend validates JWT (`Authorization: Bearer ...`) in `auth.py`.
-- User-scoped access enforced for run history and run detail APIs.
-- Admin-only logs endpoint guarded by configured allowlist.
+- **Signed-in users:** Supabase access token → `Authorization: Bearer` → verified in `auth.py` (HS256 / JWKS per config).
+- **Guests:** server-minted JWT (`/api/auth/guest`); quota in `guest_quota.py`.
+- **Full account required** for Mail link, scheduler create, and other routes that call `require_full_account`.
+
+See **`AGENT_README.md` §18** for Supabase **Redirect URLs** (`/auth/callback`) vs Gmail **redirect URI** on the API.
 
 ---
 
-## API Endpoints
+## API endpoints
 
-### Health/Auth
+### Core
 
-- `GET /api/health`
-- `GET /api/me`
+- `GET /api/health` — liveness.
+- `GET /api/me` — user + guest quota info.
+- `POST /api/auth/guest` — guest session token.
 
 ### Runs
 
-- `GET /api/runs` - list user runs (active + persisted)
-- `GET /api/runs/{run_id}` - run snapshot/detail
-- `POST /api/runs` - create run (`{ "query": "..." }`)
+- `GET /api/runs`, `GET /api/runs/{id}`, `POST /api/runs`
+- `POST /api/runs/{id}/stream-ticket`, `GET /api/runs/{id}/events` (SSE)
+- `POST /api/runs/{id}/clarification`, `POST /api/runs/{id}/formatter-followup`
 
-### Streaming
+### Notes, mail, scheduler
 
-- `POST /api/runs/{run_id}/stream-ticket`
-- `GET /api/runs/{run_id}/events?ticket=...` (SSE)
+- `GET/POST /api/notes`, `PUT/DELETE /api/notes/{id}`
+- `GET /api/mail/status`, `POST /api/mail/oauth/begin`, `GET /api/mail/oauth/callback`, `DELETE /api/mail/link`, plus mail message/send/reply routes
+- `GET/POST/PATCH/DELETE /api/scheduled-jobs`, `POST …/run-now`
 
 ### Admin
 
-- `GET /api/admin/logs` (admin users only)
+- `GET /api/admin/logs` (allowlisted user IDs)
 
 ---
 
 ## Configuration
 
-### Core config files
+- **`config/agent_config.yaml`** — agents, prompts, models, MCP attachment.
+- **`config/models.json`**, **`config/mcp_server_config.yaml`**, **`prompts/*.md`**.
 
-- `config/agent_config.yaml` - agent definitions, prompts, model mapping
-- `config/models.json` - model inventory and defaults
-- `config/profiles.yaml` - profile-level behavior toggles
-- `config/mcp_server_config.yaml` - MCP server configuration
-- `prompts/*.md` - per-agent prompting strategy
+### Environment (high level)
 
-### Common environment variables
+- **API:** `SUPABASE_*`, `GEMINI_API_KEY` (or other model keys), `LOCAL_RUN_STORE`, `SAVE_LOCAL_SESSIONS`, `RUN_TIMEOUT_SEC`, `CORS_ORIGINS`, `GMAIL_OAUTH_REDIRECT_URI`, `MAIL_OAUTH_SUCCESS_URL`, `ADMIN_USER_IDS`, …
+- **Frontend build:** `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_API_BASE_URL`
 
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `SUPABASE_JWT_SECRET` (or JWKS-based verification path)
-- `SUPABASE_JWT_ISSUER`
-- `SUPABASE_JWT_AUDIENCE`
-- `LOCAL_RUN_STORE`
-- `SAVE_LOCAL_SESSIONS`
-- `RUN_TIMEOUT_SEC`
-- `CORS_ORIGINS`
-- `ADMIN_USER_IDS`
-- model/provider keys as needed (for example Gemini-related keys)
-- frontend vars: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_API_BASE_URL`
+See **`.env.example`** and **`docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md`**.
 
 ---
 
-## Run Locally
+## Run locally
 
-### 1) Backend
+### Backend
 
 ```bash
 uv run python -m uvicorn api_server:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-### 2) Frontend
+### Frontend
 
 ```bash
 cd frontend
@@ -328,56 +352,55 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`.
+Open **`http://localhost:5173`**. Point **`VITE_API_BASE_URL`** at **`http://127.0.0.1:8000`** in the project root `.env`.
 
 ---
 
-## Render + Supabase Setup
+## Render + Supabase + Vercel
 
-For a hybrid setup (local frontend + Render backend + Supabase persistence), follow:
-
-- `docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md`
+- Step-by-step hybrid setup: **`docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md`**
+- **Render:** Python web service, env vars, optional **Secret File** for `credentials.json` (Gmail Web client).
+- **Vercel:** build `frontend/` with the `VITE_*` variables; production branch e.g. **`main`**.
+- **Supabase:** run SQL from **`db/migrations/`**; configure **Redirect URLs** for **`https://<your-domain>/auth/callback`**.
 
 ---
 
-## Project Structure
+## Project structure
 
 ```text
 S8 Share/
-├── agents/                 # Agent runner and agent execution interfaces
-├── config/                 # Agent, model, profile, MCP config
-├── core/                   # Main DAG loop, model manager, utilities
-├── db/migrations/          # Supabase schema migrations
-├── frontend/               # React app (graph + inspector + auth)
-├── memory/                 # Session graph + local run persistence
-├── mcp_servers/            # MCP servers and tool implementations
-├── prompts/                # Prompt templates per agent role
-├── tools/                  # Sandbox and helper tooling
-├── api_server.py           # FastAPI API + SSE + run orchestration entry
-├── auth.py                 # JWT auth for API
-└── app.py                  # CLI/dev entry path
+├── agents/              # Agent runner, execution
+├── config/              # YAML + JSON config
+├── core/                # AgentLoop4, model manager, utilities
+├── db/migrations/       # Supabase SQL migrations
+├── docs/                # Deploy / setup notes
+├── frontend/            # Vite React app (src/App.jsx, auth, Mail, Scheduler, …)
+├── memory/              # Local persistence (gitignored subsets)
+├── mcp_servers/         # MCP implementations + multi_mcp router
+├── prompts/             # Markdown prompts per agent
+├── tools/               # Sandbox helpers
+├── api_server.py        # FastAPI app, routes, SSE, scheduler lifespan
+├── auth.py              # JWT verification
+├── scheduler_service.py # built_query for scheduled subjects
+├── guest_quota.py       # Guest run limits
+├── lib/                 # gmail_api, gmail_oauth helpers
+└── AGENT_README.md      # Developer / agent onboarding map
 ```
 
 ---
 
 ## Troubleshooting
 
-### `401/403` from API
+| Symptom | Things to check |
+|---------|------------------|
+| **401/403** | JWT secret / issuer / audience match Supabase; `Authorization` header present. |
+| **Login loop after Google** | Supabase **Redirect URLs** include full **`…/auth/callback`**; Google OAuth client used in Supabase is **enabled**; Vercel build has correct `VITE_SUPABASE_*`. |
+| **CORS errors** | `CORS_ORIGINS` on API includes exact frontend origin (**no trailing slash**). |
+| **Guest + “CORS” on `/api/runs`** | Often a **500** behind the scenes; guests must not hit Supabase with `guest:…` as UUID (fixed in server logic — use latest `main`). |
+| **Mail “not configured”** | `credentials.json` on server (or secret file on Render); `GMAIL_OAUTH_REDIRECT_URI` matches Google Cloud. |
+| **SSE fails** | Run still active; valid stream ticket; `VITE_API_BASE_URL` correct. |
+| **Formatter looks empty** | Use **JSON** tab; renderer may be picking a metadata key instead of the rich content field. |
 
-- Verify frontend token exists and backend JWT settings match your Supabase project.
-- Confirm `SUPABASE_URL` and JWT-related env vars are set correctly.
+---
 
-### Stream not connecting
-
-- Ensure run is active (`queued`/`running`) before requesting stream ticket.
-- Confirm frontend is calling backend host/port correctly (`VITE_API_BASE_URL` or proxy).
-
-### Run history missing
-
-- Check whether you are in local or Supabase persistence mode.
-- Inspect `memory/local_runs/` and `memory/session_summaries_index/` when local persistence is enabled.
-
-### Formatter output looks too short
-
-- Inspect node `JSON` tab to verify which key contains full content.
-- If rendered view shows only summary text, verify renderer key-selection prioritizes report content keys over metadata/fallback fields.
+*Arc Reactor — multi-agent DAG research assistant.*

@@ -88,7 +88,7 @@ See **§14** for persistence, APScheduler, and UI behavior.
 - **`activity`** — short human-readable log lines for the inspector
 - **`scheduled_job_id`** (optional) — set when the run was started by a scheduled job or **run-now** from the Scheduler.
 
-Persistence: **local JSON** under `memory/local_runs/` when `LOCAL_RUN_STORE=1`, else **Supabase** `chat_runs` + logs when the service role is configured and `LOCAL_RUN_STORE` is off. **Scheduler + Notepad** use Supabase only when **`_use_supabase_store()`** is true (same condition: not `LOCAL_RUN_STORE` and Supabase enabled); otherwise jobs live in `memory/scheduled_jobs/jobs.json` and notes in `memory/notes/{user}.json`. **Gmail** tokens use Supabase whenever `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set (`RUN_STORE.enabled`), independent of `LOCAL_RUN_STORE`. Session graph files under `memory/session_summaries_index/` when `SAVE_LOCAL_SESSIONS` is on (see env table).
+Persistence: **local JSON** under `memory/local_runs/` when `LOCAL_RUN_STORE=1`, else **Supabase** `chat_runs` + logs when the service role is configured and `LOCAL_RUN_STORE` is off. **Scheduler + Notepad** use Supabase only when **`_use_supabase_store()`** is true (same condition: not `LOCAL_RUN_STORE` and Supabase enabled); otherwise jobs live in `memory/scheduled_jobs/jobs.json` and notes in `memory/notes/{user}.json`. **Gmail** tokens use Supabase whenever `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set (`RUN_STORE.enabled`), independent of `LOCAL_RUN_STORE`. **Guests** (`sub` like `guest:…`) never persist runs to Supabase (invalid UUID for `owner_user_id`); `GET /api/runs` / persisted `GET /api/runs/{id}` for guests use **`memory/local_runs/`** only so PostgREST is not called with a guest id. Session graph files under `memory/session_summaries_index/` when `SAVE_LOCAL_SESSIONS` is on (see env table).
 
 ---
 
@@ -164,7 +164,11 @@ When tools return odd shapes, **`multi_mcp`** may coerce types so **`AgentRunner
 ## 12. Frontend (`frontend/`)
 
 - **Vite + React;** main surface: `src/App.jsx` (large file — search by feature: `EventSource`, `stream-ticket`, `clarification`, `formatter`, `scheduled-jobs`, `extractUrlsFromRun`, `formatterMarkdownFromRunData`).
-- **Auth:** Supabase client + `LoginPage.jsx` / `HomePage.jsx`.
+- **Auth (Supabase PKCE):**
+  - **`src/lib/supabase.js`** — `createClient` with `auth.flowType: "pkce"`, `detectSessionInUrl`, `persistSession`, `autoRefreshToken`.
+  - **`src/main.jsx`** — `RequireAuth` wraps `/agent`: on load, if URL has `?code=` (legacy return to `/agent`), runs **`exchangeCodeForSession`** before **`getSession()`** so the session exists before the guard redirects to `/login`.
+  - **`src/AuthCallback.jsx`** + route **`/auth/callback`** — primary OAuth return URL: exchanges the code, then **`navigate("/agent")`**. **`LoginPage.jsx`** uses **`signInWithOAuth`** with **`redirectTo`** = current origin + **`/auth/callback`** so Supabase **Redirect URLs** can list a stable path (see **§18**).
+  - **`LoginPage.jsx` / `HomePage.jsx`** — session check + guest flow.
 - **Graph:** ReactFlow for nodes/edges from `snapshot`.
 - **Left rail:** **Agent Run** (default), **Notepad**, **Mail** (Gmail), **Scheduler** (clock icon).
 - **Inspector (Agent Run):** tabs **Preview** / **Rendered** / **JSON** / **Web URLs**. Output markdown uses `renderNodeOutput(selectedNode)` + `ReactMarkdown` + `remarkGfm`.
@@ -182,7 +186,9 @@ When tools return odd shapes, **`multi_mcp`** may coerce types so **`AgentRunner
 | `SAVE_LOCAL_SESSIONS` | `0` / `false` → skip writing session graph files under `memory/session_summaries_index/` |
 | `DAG_MAX_ITERATIONS` | Cap for DAG scheduler loop in `core/loop.py` (default 500) |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Cloud persistence + auth alignment |
-| `CORS_ORIGINS` | Comma-separated allowed origins (defaults include Vite `5173`) |
+| `CORS_ORIGINS` | Comma-separated allowed **browser** origins for the API (no trailing slash), e.g. `https://www.example.com,https://example.com`. Required for production frontends on Render/Vercel/custom domain. |
+| `GMAIL_OAUTH_REDIRECT_URI` | Must match Google **Mail** Web client redirect exactly (e.g. `https://<render-host>/api/mail/oauth/callback`). |
+| `MAIL_OAUTH_SUCCESS_URL` | Browser URL after Gmail link succeeds (e.g. `https://<app>/agent?mail_connected=1`). |
 | `SCHEDULER_TIMEZONE` | IANA tz for APScheduler cron (default **`America/Regina`**) |
 | `apscheduler` | Declared in `pyproject.toml`; scheduler starts in FastAPI **lifespan** in `api_server.py` |
 
@@ -227,7 +233,7 @@ See also `README.md` and `docs/RENDER_SUPABASE_LOCAL_FRONTEND_SETUP.md` for depl
 ### How Mail works in this repo (important)
 
 - The **Mail tab** uses **per-user Gmail OAuth**: each signed-in Supabase user can **Connect Gmail** once; the backend stores that user’s refresh token and builds Gmail API calls as **`userId: "me"`** for **that** account only.
-- **OAuth client file:** **`credentials.json`** at the **project root** (same `SCOPES` as `lib/gmail_api.py`). In Google Cloud, create an OAuth client of type **Web application** and set an **Authorized redirect URI** that matches the backend exactly (see env vars below).
+- **OAuth client file:** **`credentials.json`** at the **project root** (gitignored). Use a **Web application** client in Google Cloud; **`lib/gmail_oauth.py`** loads it for the Mail OAuth flow. **Render / production:** the file is not in the repo — mount it via **Render Secret File** (or equivalent) at project root as `credentials.json`. This client is **not** the same as the Google OAuth client used inside **Supabase → Sign in with Google** (see **§18**).
 - **Where tokens are stored**
   - If **`SUPABASE_URL`** and **`SUPABASE_SERVICE_ROLE_KEY`** are set (same condition as the cloud run store): table **`user_gmail_credentials`** (migration `db/migrations/005_user_gmail_credentials.sql`). Only the **service role** should read/write this table; there are **no** browser-facing RLS policies.
   - Local / file-backed mode: **`memory/gmail_users/{owner_user_id}.json`** (gitignored via `memory/gmail_users/`).
@@ -267,7 +273,43 @@ Official references (verify current policy on Google’s side):
 
 ---
 
-## 18. Glossary
+## 18. Supabase sign-in vs Gmail — two Google OAuth clients (redirect checklist)
+
+**Two different flows, two different OAuth clients in Google Cloud** (or two uses of the same project with different redirect URIs — do not confuse them).
+
+| Flow | Who redirects where | Google Cloud “Authorized redirect URIs” must include |
+|------|---------------------|------------------------------------------------------|
+| **Sign in with Google** (Supabase Auth) | Browser → Google → **Supabase** `https://<project-ref>.supabase.co/auth/v1/callback` → your app **`/auth/callback?code=`** | For the **Web client whose ID/secret you paste in Supabase → Authentication → Providers → Google**: **`https://<project-ref>.supabase.co/auth/v1/callback`**. |
+| **Connect Gmail** (Mail tab) | Browser → Google → **your API** `GET /api/mail/oauth/callback` | For the **Mail** Web client (`credentials.json`): **`https://<api-host>/api/mail/oauth/callback`** (+ localhost for dev). |
+
+**If “Sign in with Google” suddenly breaks** after Google Cloud changes: Supabase still has the **old** client ID/secret while you **disabled** or **rotated** that OAuth client. Either re-enable the client Supabase uses or **update Supabase’s Google provider** to the new client and ensure **both** redirect URIs above exist on the correct client.
+
+### Supabase Dashboard (Authentication → URL configuration)
+
+- **Redirect URLs:** must include the **full** URL Supabase is allowed to return users to — **path included**. For this app, add every origin you use with **`/auth/callback`**, for example:  
+  `https://www.<domain>/auth/callback`, `https://<apex>/auth/callback`, `https://<vercel-preview>.vercel.app/auth/callback`, `http://localhost:5173/auth/callback`, `http://127.0.0.1:5173/auth/callback`.  
+  Listing only `https://www.<domain>` **without** `/auth/callback` is **not** enough if `redirectTo` is `…/auth/callback`.
+- **Site URL:** set to your canonical public site (one primary URL).
+- **`www` vs apex:** different **origins** — use one consistently in links, or add **both** callback URLs.
+
+### Vercel / static host (frontend)
+
+- Build env: **`VITE_SUPABASE_URL`**, **`VITE_SUPABASE_ANON_KEY`**, **`VITE_API_BASE_URL`** (Render API origin, no trailing slash). Redeploy after changes.
+- **`vercel.json`** rewrites `/*` → `index.html` so **`/auth/callback`** loads the SPA.
+
+### Render (API)
+
+- **`CORS_ORIGINS`** must list every frontend origin that calls the API (comma-separated, **no trailing slash**).
+- **`SUPABASE_JWT_SECRET`** (and URL / audience) must match the **same** Supabase project as the Vite env.
+
+### Symptoms vs causes
+
+- **Bounce to `/login` after Google:** wrong or missing **Supabase Redirect URL** for `…/auth/callback`, wrong Supabase **Google provider** client/secret, or **disabled** OAuth client in Google Cloud for that provider.
+- **Browser “CORS” error on `/api/runs` for guest:** often a **500** first (guest id sent to PostgREST); fixed in code by skipping Supabase for guests (see **§5**). Ensure **CORS** origins still match.
+
+---
+
+## 19. Glossary
 
 | Term | Meaning |
 |------|---------|
@@ -281,4 +323,4 @@ Official references (verify current policy on Google’s side):
 
 ---
 
-*Last aligned with repo layout: S8 Share (Scheduler, Web URLs tab, dual scheduled-job persistence, §17 per-user Gmail OAuth). If something disagrees with code, trust the code and update this file.*
+*Last aligned with repo layout: S8 Share (§12 PKCE + `/auth/callback`, §17–18 Gmail vs Supabase Google OAuth, guest run list behavior, env table). If something disagrees with code, trust the code and update this file.*
