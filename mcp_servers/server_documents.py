@@ -8,7 +8,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mcp.server.fastmcp import FastMCP
-from models import SearchUserDocumentsInput
 
 from lib.documents import embed_texts
 from lib.documents_store import search_document_chunks
@@ -17,13 +16,13 @@ mcp = FastMCP("Document RAG")
 
 
 @mcp.tool()
-async def search_user_documents(input: SearchUserDocumentsInput) -> list[str]:
+async def search_user_documents(query: str, owner_user_id: str) -> list[str]:
     """Search the current user's uploaded documents for chunks relevant to
     the query. owner_user_id is injected by MultiMCP.route_tool_call, not
     supplied by the calling agent."""
     try:
-        query_vec = embed_texts([input.query])[0]
-        results = await search_document_chunks(input.owner_user_id, query_vec, match_count=5)
+        query_vec = embed_texts([query])[0]
+        results = await search_document_chunks(owner_user_id, query_vec, match_count=5)
         if not results:
             return ["No relevant content found in your uploaded documents."]
 

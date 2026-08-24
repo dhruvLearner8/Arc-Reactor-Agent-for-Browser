@@ -164,10 +164,6 @@ class SearchInput(BaseModel):
     query: str
     max_results: int = Field(default=10, description="Maximum number of results to return")
 
-class SearchUserDocumentsInput(BaseModel):
-    query: str
-    owner_user_id: str
-
 class UrlInput(BaseModel):
     url: str
 

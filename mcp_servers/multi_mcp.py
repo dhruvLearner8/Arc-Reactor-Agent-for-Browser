@@ -20,9 +20,9 @@ class MultiMCP:
                 "command": "uv",
                 "args": ["run", "mcp_servers/server_browser.py"],
             },
-            "rag": {
+            "documents": {
                 "command": "uv",
-                "args": ["run", "mcp_servers/server_rag.py"],
+                "args": ["run", "mcp_servers/server_documents.py"],
             },
             "sandbox": {
                 "command": "uv",
@@ -128,8 +128,15 @@ class MultiMCP:
         
         return await self.sessions[server_name].call_tool(tool_name, arguments)
 
+    # Tools that receive caller identity injected server-side, never from
+    # LLM-generated arguments (see AgentLoop4._execute_step in core/loop.py).
+    CONTEXT_INJECTED_TOOLS = {"search_user_documents"}
+
     # Helper to route tool call by finding which server has it
-    async def route_tool_call(self, tool_name: str, arguments: dict):
+    async def route_tool_call(self, tool_name: str, arguments: dict, context: dict | None = None):
+        if context and tool_name in self.CONTEXT_INJECTED_TOOLS:
+            arguments = {**arguments, **context}
+
         breaker = get_breaker(tool_name, failure_threshold=5, recovery_timeout=60.0)
         if not breaker.can_execute():
             status = breaker.get_status()
