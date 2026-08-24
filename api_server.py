@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -23,6 +23,8 @@ from auth import AuthUser, get_current_user, guest_session_key, mint_guest_acces
 from guest_quota import guest_run_limit, guest_runs_used, guest_try_consume_run
 from agents.base_agent import AgentRunner
 from core.loop import AgentLoop4
+from lib import documents_store
+from lib.documents import ingest_document
 from mcp_servers.multi_mcp import MultiMCP
 
 from scheduler_service import build_query
@@ -1632,17 +1634,25 @@ async def _execute_run(run_id: str, query: str, owner_user_id: str, owner_email:
                 )
             raise RuntimeError("Timed out waiting for clarification response")
 
+        file_manifest = []
+        if documents_store.ENABLED and not owner_user_id.startswith("guest:"):
+            ready_docs = await documents_store.list_documents(owner_user_id, status="ready")
+            file_manifest = [
+                {"filename": d["filename"], "type": d["file_type"]} for d in ready_docs
+            ]
+
         loop = AgentLoop4(
             multi_mcp=multi_mcp,
             event_callback=on_agent_activity,
             clarification_callback=on_clarification,
             progress_callback=on_context_progress,
+            owner_user_id=owner_user_id,
         )
 
         run_task = asyncio.create_task(
             loop.run(
                 query=query,
-                file_manifest=[],
+                file_manifest=file_manifest,
                 globals_schema={},
                 uploaded_files=[],
             )
@@ -1930,6 +1940,71 @@ async def delete_note(note_id: str, current_user: AuthUser = Depends(get_current
     filtered = [n for n in notes if n.get("id") not in to_delete]
     await _persist_notes(current_user.user_id, filtered)
     return {"status": "deleted", "id": note_id, "deleted_count": len(to_delete)}
+
+
+# ----- Documents API -----
+
+MAX_DOCUMENT_BYTES = 20 * 1024 * 1024  # 20MB
+ALLOWED_DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".md"}
+
+
+@app.post("/api/documents")
+async def upload_document(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    current_user: AuthUser = Depends(require_full_account),
+) -> dict[str, Any]:
+    if not documents_store.ENABLED:
+        raise HTTPException(status_code=503, detail="Document storage is not configured.")
+
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in ALLOWED_DOCUMENT_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_DOCUMENT_EXTENSIONS))}",
+        )
+
+    content = await file.read()
+    if len(content) > MAX_DOCUMENT_BYTES:
+        raise HTTPException(status_code=413, detail="File too large (max 20MB).")
+    if not content:
+        raise HTTPException(status_code=400, detail="File is empty.")
+
+    document_id = str(uuid4())
+    file_type = ext.lstrip(".")
+    await documents_store.insert_document(document_id, current_user.user_id, file.filename, file_type)
+
+    background_tasks.add_task(
+        lambda: asyncio.create_task(
+            ingest_document(document_id, current_user.user_id, file.filename, content)
+        )
+    )
+
+    return {
+        "id": document_id,
+        "filename": file.filename,
+        "file_type": file_type,
+        "status": "processing",
+    }
+
+
+@app.get("/api/documents")
+async def list_documents_endpoint(current_user: AuthUser = Depends(require_full_account)) -> list[dict[str, Any]]:
+    if not documents_store.ENABLED:
+        return []
+    return await documents_store.list_documents(current_user.user_id)
+
+
+@app.delete("/api/documents/{document_id}")
+async def delete_document_endpoint(
+    document_id: str, current_user: AuthUser = Depends(require_full_account)
+) -> dict[str, Any]:
+    if not documents_store.ENABLED:
+        raise HTTPException(status_code=503, detail="Document storage is not configured.")
+    deleted = await documents_store.delete_document(document_id, current_user.user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"status": "deleted", "id": document_id}
 
 
 # ----- Scheduled Jobs API -----
