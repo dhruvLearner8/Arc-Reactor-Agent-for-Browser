@@ -66,3 +66,69 @@ def normalize_text(text: str) -> str:
     text = _MULTI_SPACE_RE.sub(" ", text)
     text = _MULTI_NEWLINE_RE.sub("\n\n", text)
     return text.strip()
+
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$", re.MULTILINE)
+
+
+@dataclass
+class Chunk:
+    chunk_index: int
+    content: str
+    section_title: str | None
+    page_number: int | None
+
+
+def _split_by_headings(markdown: str) -> list[tuple[str | None, str]]:
+    """Split markdown into (heading_text_or_None, body) sections."""
+    matches = list(_HEADING_RE.finditer(markdown))
+    if not matches:
+        return [(None, markdown)]
+
+    sections: list[tuple[str | None, str]] = []
+    if matches[0].start() > 0:
+        preamble = markdown[: matches[0].start()].strip()
+        if preamble:
+            sections.append((None, preamble))
+
+    for i, m in enumerate(matches):
+        heading_text = m.group(2).strip()
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
+        body = markdown[body_start:body_end].strip()
+        if body:
+            sections.append((heading_text, body))
+    return sections
+
+
+def chunk_document(
+    pages: list[PageText], target_words: int = 400, overlap_words: int = 60
+) -> list[Chunk]:
+    """Deterministic markdown-aware chunking: split on headings, then pack
+    paragraphs into ~target_words chunks with overlap. No LLM call."""
+    chunks: list[Chunk] = []
+    chunk_index = 0
+
+    for page in pages:
+        for heading, body in _split_by_headings(page.markdown):
+            words = body.split()
+            if not words:
+                continue
+            start = 0
+            while start < len(words):
+                end = min(start + target_words, len(words))
+                chunk_text = " ".join(words[start:end])
+                chunks.append(
+                    Chunk(
+                        chunk_index=chunk_index,
+                        content=chunk_text,
+                        section_title=heading,
+                        page_number=page.page_number,
+                    )
+                )
+                chunk_index += 1
+                if end == len(words):
+                    break
+                start = end - overlap_words
+
+    return chunks
