@@ -48,6 +48,7 @@ class AgentLoop4:
         event_callback=None,
         clarification_callback=None,
         progress_callback=None,
+        owner_user_id: str | None = None,
     ):
         self.multi_mcp = multi_mcp
         self.strategy = strategy
@@ -56,6 +57,7 @@ class AgentLoop4:
         self.event_callback = event_callback
         self.clarification_callback = clarification_callback
         self.progress_callback = progress_callback
+        self.owner_user_id = owner_user_id
 
     def _inject_auto_clarification_if_needed(self, planner_output: dict):
         """
@@ -563,8 +565,12 @@ class AgentLoop4:
                 )
                 
                 try:
-                    # Execute tool via MultiMCP
-                    tool_result = await self.multi_mcp.route_tool_call(tool_name, tool_args)
+                    # Execute tool via MultiMCP. owner_user_id is injected
+                    # server-side for context-aware tools (e.g. document
+                    # search) — never trust the LLM to supply its own id.
+                    tool_result = await self.multi_mcp.route_tool_call(
+                        tool_name, tool_args, context={"owner_user_id": self.owner_user_id}
+                    )
                     
                     # Serialize result content
                     if isinstance(tool_result.content, list):
