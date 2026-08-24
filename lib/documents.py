@@ -165,3 +165,43 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
             vec = vec / norm
         result.append(vec.tolist())
     return result
+
+
+async def ingest_document(document_id: str, owner_user_id: str, filename: str, content: bytes) -> None:
+    """Full pipeline: extract -> normalize -> chunk -> embed -> store.
+    Never raises; failures are recorded on the document row itself so a bad
+    upload never crashes the caller (matches spec section 9)."""
+    from lib import documents_store as store
+
+    try:
+        pages = extract_text(filename, content)
+        pages = [PageText(page_number=p.page_number, markdown=normalize_text(p.markdown)) for p in pages]
+
+        chunks = chunk_document(pages)
+        if not chunks:
+            await store.update_document_status(
+                document_id, "failed", error_message="No extractable text found in this file."
+            )
+            return
+
+        texts = [c.content for c in chunks]
+        vectors = embed_texts(texts)
+
+        rows = [
+            {
+                "document_id": document_id,
+                "owner_user_id": owner_user_id,
+                "chunk_index": c.chunk_index,
+                "section_title": c.section_title,
+                "page_number": c.page_number,
+                "content": c.content,
+                "embedding": vec,
+            }
+            for c, vec in zip(chunks, vectors)
+        ]
+        await store.insert_document_chunks(rows)
+        await store.update_document_status(document_id, "ready", chunk_count=len(rows))
+
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: this must never propagate
+        from lib import documents_store as store  # re-import in case the first import site failed
+        await store.update_document_status(document_id, "failed", error_message=str(exc)[:500])
