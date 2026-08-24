@@ -15,19 +15,25 @@ agents:
   CoderAgent:
     prompt_file: "prompts/coder.md"
     model: "gemini"
-    mcp_servers: ["sandbox", "browser", "rag"]
+    mcp_servers: ["sandbox", "browser"]
     description: "Writes Python code to analyze data or solve problems."
 
   RetrieverAgent:
     prompt_file: "prompts/retriever.md"
     model: "gemini"
-    mcp_servers: ["rag", "browser", "weather"]
-    description: "Searches local documents and web; live weather via Open-Meteo tool."
+    mcp_servers: ["browser", "weather"]
+    description: "Searches the web; live weather via Open-Meteo tool."
+
+  DocumentQAAgent:
+    prompt_file: "prompts/document_qa.md"
+    model: "gemini"
+    mcp_servers: ["documents"]
+    description: "Answers questions using the user's uploaded documents via vector search."
 
   SummarizerAgent:
     prompt_file: "prompts/summarizer.md"
     model: "gemini"
-    mcp_servers: ["browser", "rag"]
+    mcp_servers: ["browser"]
     description: "Synthesizes final answers."
 
   DistillerAgent:

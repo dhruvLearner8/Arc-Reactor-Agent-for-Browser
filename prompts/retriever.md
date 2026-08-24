@@ -20,7 +20,6 @@ Return **strict JSON** (no prose) and always use the exact variable names from `
 - `web_extract_text(url)` -> extracted text
 - `webpage_url_to_raw_text(url)` -> extracted text payload
 - `search_web_with_text_content(query)` -> bulk URL+content payload
-- `search_stored_documents_rag(query)` -> internal docs retrieval
 
 ## Execution Patterns
 

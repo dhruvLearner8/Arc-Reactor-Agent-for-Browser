@@ -81,7 +81,7 @@ Each task (`node`) must include:
 {
   "id": "T003",
   "description": "...",
-  "agent": "RetrieverAgent" | "ThinkerAgent" | "DistillerAgent" | "CoderAgent" | "FormatterAgent" | "QAAgent" | "ClarificationAgent" | "SchedulerAgent" | "PlannerAgent",
+  "agent": "RetrieverAgent" | "DocumentQAAgent" | "ThinkerAgent" | "DistillerAgent" | "CoderAgent" | "FormatterAgent" | "QAAgent" | "ClarificationAgent" | "SchedulerAgent" | "PlannerAgent",
   "agent_prompt": "...",
   "reads": [agent_output_T002, agent_result_T001],
   "writes": [agent_output_T003]
@@ -172,7 +172,12 @@ For timeline, schedule, or flow-based projects:
 
 Simulate layered planning like a real team:
 
-* **RetrieverAgent**: Gathers raw external or document-based info
+* **RetrieverAgent**: Gathers raw external info from the open web.
+* **DocumentQAAgent**: Answers questions using documents the user has
+  uploaded (listed in `file_manifest`). Use this — not RetrieverAgent —
+  whenever the query should be answered from an uploaded document rather
+  than the web. Reference the relevant filename(s) from `file_manifest` in
+  the `agent_prompt`.
 * **ThinkerAgent**: Clusters, compares, or resolves logic
 * **DistillerAgent**: Synthesizes summaries or bullets
 * **CoderAgent**: Thinks, writes, and automatically executes required code in a single atomic step.  
