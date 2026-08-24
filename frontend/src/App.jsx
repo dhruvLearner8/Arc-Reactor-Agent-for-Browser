@@ -12,6 +12,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import TurndownService from "turndown";
 import { supabase } from "./lib/supabase";
+import DocumentsPanel from "./DocumentsPanel.jsx";
 
 const statusColor = {
   pending: "#9ca3af",
@@ -2120,7 +2121,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""} ${activeSection === "notes" ? "notes-mode" : ""} ${activeSection === "mail" ? "mail-mode" : ""} ${activeSection === "scheduler" ? "scheduler-mode" : ""}`}>
+      <div className={`app-shell ${inspectorExpanded ? "inspector-expanded" : ""} ${activeSection === "notes" ? "notes-mode" : ""} ${activeSection === "mail" ? "mail-mode" : ""} ${activeSection === "scheduler" ? "scheduler-mode" : ""} ${activeSection === "documents" ? "documents-mode" : ""}`}>
         <aside className="left-nav-rail">
           <button
             className={`rail-icon-btn ${activeSection === "run" ? "active" : ""}`}
@@ -2149,6 +2150,13 @@ export default function App() {
             title="Scheduler"
           >
             ⏰
+          </button>
+          <button
+            className={`rail-icon-btn ${activeSection === "documents" ? "active" : ""}`}
+            onClick={() => setActiveSection("documents")}
+            title="Documents"
+          >
+            📄
           </button>
         </aside>
         {activeSection === "run" ? (
@@ -2974,6 +2982,14 @@ export default function App() {
             ) : null}
           </main>
           )
+        ) : activeSection === "documents" ? (
+          <DocumentsPanel
+            accessToken={accessToken}
+            getAuthHeaders={getAuthHeaders}
+            apiUrl={apiUrl}
+            readErrorMessage={readErrorMessage}
+            isGuest={isGuest}
+          />
         ) : (
           <main className="notes-panel">
             <div className="notes-menubar">
