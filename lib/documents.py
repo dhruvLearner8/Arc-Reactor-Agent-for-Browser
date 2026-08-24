@@ -132,3 +132,36 @@ def chunk_document(
                 start = end - overlap_words
 
     return chunks
+
+
+EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_DIM = 768
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Batch-embed texts via Gemini. Vectors are L2-normalized (required when
+    using a non-default output_dimensionality, per Gemini API docs)."""
+    if not texts:
+        return []
+
+    import numpy as np
+    from google import genai
+    from google.genai import types
+
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    client = genai.Client(api_key=api_key)
+
+    response = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=texts,
+        config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIM),
+    )
+
+    result = []
+    for embedding in response.embeddings:
+        vec = np.array(embedding.values, dtype=float)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        result.append(vec.tolist())
+    return result
