@@ -1974,11 +1974,7 @@ async def upload_document(
     file_type = ext.lstrip(".")
     await documents_store.insert_document(document_id, current_user.user_id, file.filename, file_type)
 
-    background_tasks.add_task(
-        lambda: asyncio.create_task(
-            ingest_document(document_id, current_user.user_id, file.filename, content)
-        )
-    )
+    background_tasks.add_task(ingest_document, document_id, current_user.user_id, file.filename, content)
 
     return {
         "id": document_id,
