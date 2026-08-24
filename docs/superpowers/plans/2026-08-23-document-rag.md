@@ -932,9 +932,22 @@ git commit -m "Add end-to-end document ingestion orchestration"
 
 **Interfaces:**
 - Consumes: `lib.documents.embed_texts`, `lib.documents_store.search_document_chunks`.
-- Produces: `SearchUserDocumentsInput(BaseModel)` with fields `query: str`, `owner_user_id: str`; MCP tool `search_user_documents(input: SearchUserDocumentsInput) -> list[str]`.
+- Produces: MCP tool `search_user_documents(query: str, owner_user_id: str) -> list[str]`.
 
-- [ ] **Step 1: Replace `SearchDocumentsInput` in `mcp_servers/models.py`**
+**Correction found during execution:** the spec/plan originally called for a
+`SearchUserDocumentsInput(BaseModel)` wrapper, matching the old (dead)
+`server_rag.py`'s style. Live-testing against the actual MCP stdio
+subprocess showed FastMCP wraps a single Pydantic-model parameter under
+its own parameter name (`{"input": {...}}`) rather than flattening it —
+which doesn't match `route_tool_call`'s flat `{**arguments, **context}`
+injection. Every other tool in this codebase (`get_current_weather`,
+`web_search`, `run_python_script`, ...) uses plain typed kwargs instead —
+the wrapped-model style was unique to the dead `server_rag.py` and had
+never actually been exercised. Fixed by using plain kwargs, matching the
+established working convention; `mcp_servers/models.py` needs no new
+model at all.
+
+- [ ] **Step 1: Remove `SearchDocumentsInput` from `mcp_servers/models.py`**
 
 Find this block (currently present):
 
@@ -943,13 +956,7 @@ class SearchDocumentsInput(BaseModel):
     query: str
 ```
 
-Replace it with:
-
-```python
-class SearchUserDocumentsInput(BaseModel):
-    query: str
-    owner_user_id: str
-```
+Delete it — no replacement model is needed (see correction note above).
 
 - [ ] **Step 2: Delete the old dead RAG server and its empty data directories**
 
@@ -972,7 +979,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from mcp.server.fastmcp import FastMCP
-from models import SearchUserDocumentsInput
 
 from lib.documents import embed_texts
 from lib.documents_store import search_document_chunks
@@ -981,13 +987,13 @@ mcp = FastMCP("Document RAG")
 
 
 @mcp.tool()
-async def search_user_documents(input: SearchUserDocumentsInput) -> list[str]:
+async def search_user_documents(query: str, owner_user_id: str) -> list[str]:
     """Search the current user's uploaded documents for chunks relevant to
     the query. owner_user_id is injected by MultiMCP.route_tool_call, not
     supplied by the calling agent."""
     try:
-        query_vec = embed_texts([input.query])[0]
-        results = await search_document_chunks(input.owner_user_id, query_vec, match_count=5)
+        query_vec = embed_texts([query])[0]
+        results = await search_document_chunks(owner_user_id, query_vec, match_count=5)
         if not results:
             return ["No relevant content found in your uploaded documents."]
 
