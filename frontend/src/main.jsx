@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { Analytics } from "@vercel/analytics/react";
 import App from "./App";
 import HomePage from "./HomePage";
 import LoginPage from "./LoginPage";
@@ -80,6 +81,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(
         />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+      <Analytics />
     </BrowserRouter>
   </React.StrictMode>
 );
